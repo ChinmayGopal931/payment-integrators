@@ -3,7 +3,6 @@ pragma solidity ^0.8.20;
 
 import { IP2PIntegrator } from "../../interfaces/IP2PIntegrator.sol";
 import { IB2BGateway } from "../../interfaces/IB2BGateway.sol";
-import { IOrderFlow } from "../../interfaces/IOrderFlow.sol";
 import { UserProxy } from "../../base/UserProxy.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -276,12 +275,12 @@ contract HypeHouseRampIntegrator is IP2PIntegrator {
         _assertAllowed(user, amountUsdc);
 
         uint256 day = block.timestamp / 1 days;
+        // PROXY-AS-PLACER, and it is not optional: the B2B gateway is
+        // proxy-only. The user's UserProxy is the msg.sender that calls
+        // placeB2BOrder, and the gateway resolves that back to this integrator
+        // by re-deriving the CREATE2 address. Calling the Diamond directly from
+        // here would simply fail authentication.
         address proxy = _ensureProxy(user);
-        // Captured BEFORE the call: the Diamond reads-then-increments and
-        // placeB2BOrder's return value does not survive the proxy's `execute`
-        // (IOrderFlow.sol:12-14). getNextOrderId lives on IOrderFlow, not on
-        // IB2BGateway.
-        orderId = IOrderFlow(diamond).getNextOrderId();
 
         // The recipient is THE control, so it is read from storage and never
         // from an argument - and it is recorded on the order itself, because
@@ -296,7 +295,15 @@ contract HypeHouseRampIntegrator is IP2PIntegrator {
         );
         // usdcAllowance = 0: placeB2BOrder pulls nothing at placement. Payment
         // settles off-chain and the Diamond pulls via the proxy at completion.
-        UserProxy(proxy).execute(diamond, placeData, address(usdc), 0);
+        // The orderId comes back through `execute`, which returns the call's
+        // return data verbatim - the same way showdown reads it. An earlier
+        // draft pre-read getNextOrderId() instead, on the belief that the return
+        // value did not survive the proxy. It does, and the pre-read was also
+        // strictly worse: it depends on the Diamond reads-then-increments, and
+        // it records the wrong id whenever the gateway hands back an id it chose
+        // for itself.
+        bytes memory result = UserProxy(proxy).execute(diamond, placeData, address(usdc), 0);
+        orderId = abi.decode(result, (uint256));
 
         // Debited AFTER the call, not before. The Diamond invokes
         // validateOrder DURING placement, and that runs the same _assertAllowed

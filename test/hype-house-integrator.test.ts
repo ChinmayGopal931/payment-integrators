@@ -147,6 +147,36 @@ describe("HypeHouseRampIntegrator", function () {
     });
   });
 
+  describe("the order id", function () {
+    it("comes from the Diamond's RETURN VALUE, not a pre-read", async function () {
+      // execute() hands back the call's return data verbatim, so placeB2BOrder's
+      // orderId survives the proxy. An earlier draft pre-read getNextOrderId()
+      // instead; this is the case that proves the difference.
+      await register();
+      await mockDiamond.setForceOrderId(4242);
+      await integrator.connect(user).userPlaceOrder(USDC(10), INR, 0, "pk");
+      // Recorded against the id the Diamond actually used. A pre-read would have
+      // filed this under nextOrderId (1) and then cancelled the wrong row.
+      expect(await integrator.orderUserOf(4242)).to.equal(user.address);
+      expect(await integrator.orderUserOf(1)).to.equal(ethers.ZeroAddress);
+    });
+
+    it("so a cancel finds the right row", async function () {
+      // The consequence, not just the bookkeeping: onOrderCancel looks the user
+      // up BY order id, so a mis-recorded id silently releases nothing.
+      await register();
+      await mockDiamond.setForceOrderId(777);
+      await integrator.setCaps(USDC(500), USDC(500), 5);
+      await integrator.connect(user).userPlaceOrder(USDC(500), INR, 0, "pk");
+      await mockDiamond.simulateOrderCancelled(777);
+      expect(await integrator.inFlightOf(user.address)).to.equal(0n);
+      expect(await integrator.cancelCountOf(user.address)).to.equal(1n);
+      // ...and the daily allowance came back.
+      await expect(integrator.connect(user).userPlaceOrder(USDC(500), INR, 0, "pk")).to.not.be
+        .reverted;
+    });
+  });
+
   describe("the blacklist read", function () {
     it("refuses a user flagged on ReputationManager", async function () {
       await register();
