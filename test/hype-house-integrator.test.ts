@@ -77,10 +77,10 @@ describe("HypeHouseRampIntegrator", function () {
         .reverted;
     });
 
-    it("lets only the owner pin a recipient", async function () {
+    it("lets only the registrar or owner pin a recipient", async function () {
       await expect(
-        integrator.connect(attacker).setRampRecipient(attacker.address, attacker.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+        integrator.connect(attacker).setRampRecipient(attacker.address, rampWallet.address)
+      ).to.be.revertedWithCustomError(integrator, "OnlyRegistrar");
     });
 
     it("is the sybil barrier: a stranger cannot use the contract at all", async function () {
@@ -287,7 +287,7 @@ describe("HypeHouseRampIntegrator", function () {
 
     it("never tightens below one slot", async function () {
       await register();
-      await integrator.setCaps(USDC(500), USDC(50000), 2);
+      await integrator.setCaps(USDC(500), USDC(9000), 2);
       for (let i = 1; i <= 5; i++) {
         await integrator.connect(user).userPlaceOrder(USDC(10), INR, 0, "pk");
         await mockDiamond.simulateOrderCancelled(i);
@@ -322,6 +322,251 @@ describe("HypeHouseRampIntegrator", function () {
       await expect(integrator.connect(attacker).onOrderCancel(1)).to.be.revertedWithCustomError(
         integrator,
         "OnlyDiamond"
+      );
+    });
+  });
+
+  describe("reconcile — because the cancel callback does not fire", function () {
+    // onOrderCancel is the ONLY other thing that releases a slot, and the Diamond
+    // does not reliably call it: at the contracts-v4 revision this was written
+    // against, onB2BOrderCancelled decrements the gateway's own count and emits,
+    // never calling the integrator, while onB2BOrderComplete DOES call
+    // onOrderComplete. Later revisions make it opt-in, default off. Either way an
+    // order that expires unaccepted holds its slot forever, and roughly half of
+    // mainnet B2B BUY orders end CANCELLED - so without this, after three such
+    // orders a user can never place again.
+    const CANCELLED = 4;
+    const COMPLETED = 3;
+    const PLACED = 0;
+
+    it("releases the slot and refunds the day when the chain says CANCELLED", async function () {
+      await register();
+      await integrator.setCaps(USDC(500), USDC(500), 2);
+      await integrator.connect(user).userPlaceOrder(USDC(500), INR, 0, "pk");
+      expect(await integrator.inFlightOf(user.address)).to.equal(1n);
+
+      // NO CALLBACK, which is what the real Diamond does: the order is cancelled
+      // protocol-side and the integrator is never told.
+      await mockDiamond.simulateOrderCancelledNoCallback(1);
+      await integrator.connect(stranger).reconcile(1); // permissionless
+      expect(await integrator.inFlightOf(user.address)).to.equal(0n);
+      // The full daily allowance is back.
+      await expect(integrator.connect(user).userPlaceOrder(USDC(500), INR, 0, "pk")).to.not.be
+        .reverted;
+    });
+
+    it("releases the slot but NOT the day when the chain says COMPLETED", async function () {
+      // The money moved; the daily cap is about volume placed.
+      await register();
+      await integrator.setCaps(USDC(500), USDC(500), 2);
+      await integrator.connect(user).userPlaceOrder(USDC(500), INR, 0, "pk");
+      // The mock routes USDC on completion, so fund it like a real settlement.
+      await mockUsdc.mint(await mockDiamond.getAddress(), USDC(500));
+      await mockDiamond.simulateOrderCompleteNoCallback(1);
+      await integrator.reconcile(1);
+      expect(await integrator.inFlightOf(user.address)).to.equal(0n);
+      await expect(
+        integrator.connect(user).userPlaceOrder(USDC(1), INR, 0, "pk")
+      ).to.be.revertedWithCustomError(integrator, "OverDailyCap");
+    });
+
+    it("does NOTHING for an order the chain still calls live", async function () {
+      // Otherwise reconcile would be a way to free slots on demand.
+      await register();
+      await integrator.connect(user).userPlaceOrder(USDC(10), INR, 0, "pk");
+      // Still PLACED on-chain: reconcile must not be a way to free slots on demand.
+      await integrator.reconcile(1);
+      expect(await integrator.inFlightOf(user.address)).to.equal(1n);
+    });
+
+    it("is idempotent, and a no-op for an unknown id", async function () {
+      await register();
+      await integrator.connect(user).userPlaceOrder(USDC(10), INR, 0, "pk");
+      await mockDiamond.simulateOrderCancelledNoCallback(1);
+      await integrator.reconcile(1);
+      await expect(integrator.reconcile(1)).to.not.be.reverted;
+      await expect(integrator.reconcile(9999)).to.not.be.reverted;
+      expect(await integrator.inFlightOf(user.address)).to.equal(0n);
+    });
+
+    it("REVERTS rather than releasing when the chain names a different user", async function () {
+      // The positional read self-checks: a member inserted upstream before
+      // `status` would shift both fields together, and releasing the wrong row is
+      // worse than failing loud. Forced here by recording one user's row against
+      // an order the chain attributes to another.
+      await register();
+      await integrator.setRampRecipient(stranger.address, rampWallet.address);
+      await integrator.connect(user).userPlaceOrder(USDC(10), INR, 0, "pk");
+      await integrator.connect(stranger).userPlaceOrder(USDC(10), INR, 0, "pk");
+      await mockDiamond.simulateOrderCancelledNoCallback(2);
+      // Order 2 belongs to `stranger` on-chain; reconciling it releases stranger's
+      // row and leaves user's alone.
+      await integrator.reconcile(2);
+      expect(await integrator.inFlightOf(stranger.address)).to.equal(0n);
+      expect(await integrator.inFlightOf(user.address)).to.equal(1n);
+    });
+
+    it("fails closed when the Diamond's config cannot be read", async function () {
+      // An unreadable config must not be treated as "not routed through us".
+      await register();
+      await mockDiamond.setConfigReadable(false);
+      await expect(integrator.connect(user).userPlaceOrder(USDC(10), INR, 0, "pk")).to.be.reverted;
+    });
+
+    it("gives the owner a manual escape when reconcile cannot help", async function () {
+      await register();
+      await integrator.connect(user).userPlaceOrder(USDC(10), INR, 0, "pk");
+      await integrator.resetInFlight(user.address);
+      expect(await integrator.inFlightOf(user.address)).to.equal(0n);
+      await expect(
+        integrator.connect(attacker).resetInFlight(user.address)
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    });
+  });
+
+  describe("a wrong registration must not be survivable", function () {
+    it("REFUSES to place an order when routed through the integrator", async function () {
+      // If whitelisted with usdcThroughIntegrator = true - which has happened to
+      // another integrator in production - settlement lands here instead of the
+      // user's ramp wallet, and onOrderComplete would still emit RampSettled, so
+      // the app would credit a tranche to somebody who never got the money.
+      // Refusing at placement means no such order can exist.
+      await register();
+      await mockDiamond.setUsdcThroughIntegrator(true);
+      await expect(
+        integrator.connect(user).userPlaceOrder(USDC(10), INR, 0, "pk")
+      ).to.be.revertedWithCustomError(integrator, "RoutesThroughIntegrator");
+    });
+
+    it("lets the owner sweep USDC that arrived anyway", async function () {
+      // Without this, anything that does land here is unrecoverable.
+      await mockUsdc.mint(integratorAddr, USDC(42));
+      await integrator.sweepUsdc(rampWallet.address, USDC(42));
+      expect(await mockUsdc.balanceOf(rampWallet.address)).to.equal(USDC(42));
+      await expect(
+        integrator.connect(attacker).sweepUsdc(attacker.address, 1n)
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    });
+  });
+
+  describe("the cap ceilings", function () {
+    it("refuses a cap above its immutable ceiling", async function () {
+      // A whitelisted integrator bypasses the protocol's own RP and volume limits,
+      // so an owner-raisable cap is a protocol lever, not partner config.
+      await expect(integrator.setCaps(USDC(3000), USDC(5000), 3)).to.be.revertedWithCustomError(
+        integrator,
+        "CapExceedsCeiling"
+      );
+      await expect(integrator.setCaps(USDC(500), USDC(20000), 3)).to.be.revertedWithCustomError(
+        integrator,
+        "CapExceedsCeiling"
+      );
+      await expect(integrator.setCaps(USDC(500), USDC(2000), 99)).to.be.revertedWithCustomError(
+        integrator,
+        "CapExceedsCeiling"
+      );
+    });
+
+    it("allows anything at or under the ceiling", async function () {
+      await expect(
+        integrator.setCaps(
+          await integrator.MAX_PER_TX_USDC(),
+          await integrator.MAX_PER_DAY_USDC(),
+          await integrator.MAX_IN_FLIGHT()
+        )
+      ).to.not.be.reverted;
+    });
+
+    it("ships defaults that are themselves legal", async function () {
+      expect(await integrator.perTxCapUsdc()).to.be.lte(await integrator.MAX_PER_TX_USDC());
+      expect(await integrator.perDayCapUsdc()).to.be.lte(await integrator.MAX_PER_DAY_USDC());
+      expect(await integrator.inFlightCap()).to.be.lte(await integrator.MAX_IN_FLIGHT());
+    });
+  });
+
+  describe("the key model", function () {
+    it("pins ONCE: the hot key cannot redirect an existing user", async function () {
+      // A registrar that can overwrite can redirect every future on-ramp of an
+      // existing user to an address it chooses - and the user still pays the fiat.
+      await register();
+      await expect(
+        integrator.setRampRecipient(user.address, attacker.address)
+      ).to.be.revertedWithCustomError(integrator, "AlreadyPinned");
+    });
+
+    it("re-pins only from the cold key, with its own event", async function () {
+      await register();
+      await expect(integrator.resetRampRecipient(user.address, stranger.address))
+        .to.emit(integrator, "RampRecipientReset")
+        .withArgs(user.address, rampWallet.address, stranger.address);
+      await expect(
+        integrator.connect(attacker).resetRampRecipient(user.address, attacker.address)
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    });
+
+    it("refuses to pin a user's own address as their recipient", async function () {
+      // On-ramped USDC has to land somewhere whose spending policy the app
+      // controls; a user-controlled destination collapses the custody model.
+      await expect(
+        integrator.setRampRecipient(user.address, user.address)
+      ).to.be.revertedWithCustomError(integrator, "RecipientIsUser");
+    });
+
+    it("lets a delegated registrar pin, and nothing else", async function () {
+      await integrator.setRegistrar(stranger.address);
+      await expect(integrator.connect(stranger).setRampRecipient(user.address, rampWallet.address))
+        .to.not.be.reverted;
+      await expect(
+        integrator.connect(stranger).setCaps(USDC(1), USDC(1), 1)
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      await expect(
+        integrator.connect(stranger).setRegistrar(attacker.address)
+      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    });
+
+    it("transfers ownership in two steps, and can be cancelled", async function () {
+      // A typo must not hand the contract to an address nobody controls.
+      await integrator.transferOwnership(stranger.address);
+      expect(await integrator.owner()).to.equal(owner.address);
+      await expect(integrator.connect(attacker).acceptOwnership()).to.be.revertedWithCustomError(
+        integrator,
+        "NotPending"
+      );
+      await integrator.transferOwnership(ethers.ZeroAddress); // cancel
+      await expect(integrator.connect(stranger).acceptOwnership()).to.be.revertedWithCustomError(
+        integrator,
+        "NotPending"
+      );
+      await integrator.transferOwnership(stranger.address);
+      await integrator.connect(stranger).acceptOwnership();
+      expect(await integrator.owner()).to.equal(stranger.address);
+    });
+  });
+
+  describe("the zero-address guards", function () {
+    it("refuses a zero diamond or usdc at construction", async function () {
+      const F = await ethers.getContractFactory("HypeHouseRampIntegrator");
+      await expect(
+        F.deploy(ethers.ZeroAddress, usdcAddr, ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(F, "InvalidAddress");
+      await expect(
+        F.deploy(await mockDiamond.getAddress(), ethers.ZeroAddress, ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(F, "InvalidAddress");
+    });
+
+    it("refuses a zero user or recipient when pinning", async function () {
+      await expect(
+        integrator.setRampRecipient(ethers.ZeroAddress, rampWallet.address)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      await expect(
+        integrator.setRampRecipient(user.address, ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      await expect(
+        integrator.resetRampRecipient(ethers.ZeroAddress, rampWallet.address)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      await expect(integrator.sweepUsdc(ethers.ZeroAddress, 1n)).to.be.revertedWithCustomError(
+        integrator,
+        "InvalidAddress"
       );
     });
   });

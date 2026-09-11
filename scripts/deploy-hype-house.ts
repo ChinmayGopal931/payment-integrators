@@ -32,6 +32,21 @@ import { ethers, network } from "hardhat";
  *   IN_FLIGHT_CAP          (optional, default 3)
  */
 
+/**
+ * Network presets, as deploy-own.ts does. Base Sepolia has no preset because the
+ * Diamond and USDC move around there; pass both explicitly.
+ */
+const PRESETS: Record<number, { label: string; diamond?: string; usdc?: string; rm?: string }> = {
+  8453: {
+    label: "Base mainnet",
+    diamond: "0x4cad6eC90e65baBec9335cAd728DDC610c316368",
+    usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    rm: "0xCF613e08EE1B4c2669DdCf06A7d22c9856f6Aa1D",
+  },
+  84532: { label: "Base Sepolia" },
+};
+
+const DRY_RUN = process.env.DRY_RUN === "1" || process.env.DRY_RUN === "true";
 const DIAMOND_ADDRESS = process.env.DIAMOND_ADDRESS || "";
 const USDC_ADDRESS = process.env.USDC_ADDRESS || "";
 const REPUTATION_MANAGER = process.env.REPUTATION_MANAGER || "";
@@ -41,43 +56,80 @@ const BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 /** ReputationManager on Base mainnet, verified by probing `rmusers(address)`. */
 const BASE_REPUTATION_MANAGER = "0xCF613e08EE1B4c2669DdCf06A7d22c9856f6Aa1D";
 
+/** Reads the 5-word IntegratorConfig raw, so a struct that gained a member does
+ *  not break the read. Word 1 is usdcThroughIntegrator, word 2 is
+ *  cancelCallbackEnabled on the revisions that have it. */
+async function readConfig(diamond: string, integrator: string) {
+  const data =
+    "0x" +
+    ethers.id("getIntegratorConfig(address)").slice(2, 10) +
+    integrator.slice(2).toLowerCase().padStart(64, "0");
+  const out = await ethers.provider.call({ to: diamond, data });
+  const words = (out.slice(2).match(/.{64}/g) ?? []).map((w) => BigInt("0x" + w));
+  return {
+    words: words.length,
+    isActive: words[0] === 1n,
+    usdcThroughIntegrator: words[1] === 1n,
+    // Only meaningful where the struct carries it; 5 words means it does.
+    cancelCallbackEnabled: words.length >= 5 ? words[2] === 1n : undefined,
+  };
+}
+
 async function main() {
-  // Validated as ADDRESSES, not merely non-empty: a malformed value otherwise
-  // dies later inside an opaque ABI-encode error.
-  if (!ethers.isAddress(DIAMOND_ADDRESS)) {
-    throw new Error(`DIAMOND_ADDRESS missing or not an address: "${DIAMOND_ADDRESS}"`);
+  const net = await ethers.provider.getNetwork();
+  const chainId = Number(net.chainId);
+  const preset = PRESETS[chainId];
+  if (!preset) throw new Error(`Unsupported chainId ${chainId} - expected 8453 or 84532`);
+  console.log(`Network: ${preset.label} (${chainId})${DRY_RUN ? "  ** DRY RUN **" : ""}`);
+
+  // Env wins over the preset, so a one-off deploy needs no code change. Validated
+  // as ADDRESSES and not merely non-empty: a malformed value otherwise dies later
+  // inside an opaque ABI-encode error.
+  const diamondAddr = DIAMOND_ADDRESS || preset.diamond || "";
+  const usdcAddr = USDC_ADDRESS || preset.usdc || "";
+  const rmAddr = REPUTATION_MANAGER || preset.rm || "";
+  if (!ethers.isAddress(diamondAddr)) {
+    throw new Error(`DIAMOND_ADDRESS missing or not an address: "${diamondAddr}"`);
   }
-  if (!ethers.isAddress(USDC_ADDRESS)) {
-    throw new Error(`USDC_ADDRESS missing or not an address: "${USDC_ADDRESS}"`);
+  if (!ethers.isAddress(usdcAddr)) {
+    throw new Error(`USDC_ADDRESS missing or not an address: "${usdcAddr}"`);
   }
   // Deliberately REQUIRED rather than defaulted to address(0): the blacklist
   // check is the one control here that does not depend on our own app being
   // correct, and silently deploying without it because an env var was unset is
   // exactly how it would end up missing in production. Opting out has to be
   // explicit.
-  if (!ethers.isAddress(REPUTATION_MANAGER)) {
+  if (!ethers.isAddress(rmAddr)) {
     throw new Error(
-      `REPUTATION_MANAGER missing or not an address: "${REPUTATION_MANAGER}". ` +
+      `REPUTATION_MANAGER missing or not an address: "${rmAddr}". ` +
         `Base mainnet is ${BASE_REPUTATION_MANAGER}. Pass the zero address explicitly ` +
         `to deploy WITHOUT the user-blacklist check.`
     );
   }
 
+  if (DRY_RUN) {
+    console.log("\nDRY RUN - resolved inputs only, nothing deployed:");
+    console.log(`  DIAMOND_ADDRESS    ${diamondAddr}`);
+    console.log(`  USDC_ADDRESS       ${usdcAddr}`);
+    console.log(`  REPUTATION_MANAGER ${rmAddr}`);
+    const pre = await readConfig(diamondAddr, "0x".padEnd(42, "0")).catch(() => null);
+    console.log(`  Diamond reachable  ${pre ? "yes" : "no"}`);
+    return;
+  }
+
   const [deployer] = await ethers.getSigners();
   console.log("Deployer (owner):  ", await deployer.getAddress());
-  console.log("Diamond:           ", DIAMOND_ADDRESS);
-  console.log("USDC:              ", USDC_ADDRESS);
+  console.log("Diamond:           ", diamondAddr);
+  console.log("USDC:              ", usdcAddr);
   console.log(
     "ReputationManager: ",
-    REPUTATION_MANAGER === ethers.ZeroAddress
-      ? `${ethers.ZeroAddress}  ** BLACKLIST CHECK DISABLED **`
-      : REPUTATION_MANAGER
+    rmAddr === ethers.ZeroAddress ? `${ethers.ZeroAddress}  ** BLACKLIST CHECK DISABLED **` : rmAddr
   );
   console.log("");
 
   console.log("Deploying HypeHouseRampIntegrator (no custody)...");
   const Factory = await ethers.getContractFactory("HypeHouseRampIntegrator");
-  const integrator = await Factory.deploy(DIAMOND_ADDRESS, USDC_ADDRESS, REPUTATION_MANAGER);
+  const integrator = await Factory.deploy(diamondAddr, usdcAddr, rmAddr);
   await integrator.deploymentTransaction()?.wait(3);
   const address = await integrator.getAddress();
   const code = await ethers.provider.getCode(address);
@@ -90,15 +142,15 @@ async function main() {
   const boundDiamond: string = await integrator.diamond();
   const boundUsdc: string = await integrator.usdc();
   const boundRm: string = await integrator.reputationManager();
-  if (boundUsdc.toLowerCase() !== USDC_ADDRESS.toLowerCase()) {
-    throw new Error(`integrator.usdc() ${boundUsdc} != ${USDC_ADDRESS} — wrong token. ABORT.`);
+  if (boundUsdc.toLowerCase() !== usdcAddr.toLowerCase()) {
+    throw new Error(`integrator.usdc() ${boundUsdc} != ${usdcAddr} — wrong token. ABORT.`);
   }
-  if (boundDiamond.toLowerCase() !== DIAMOND_ADDRESS.toLowerCase()) {
+  if (boundDiamond.toLowerCase() !== diamondAddr.toLowerCase()) {
     throw new Error(
-      `integrator.diamond() ${boundDiamond} != ${DIAMOND_ADDRESS} — wrong Diamond. ABORT.`
+      `integrator.diamond() ${boundDiamond} != ${diamondAddr} — wrong Diamond. ABORT.`
     );
   }
-  if (boundRm.toLowerCase() !== REPUTATION_MANAGER.toLowerCase()) {
+  if (boundRm.toLowerCase() !== rmAddr.toLowerCase()) {
     throw new Error(`integrator.reputationManager() ${boundRm} != ${REPUTATION_MANAGER}. ABORT.`);
   }
 
@@ -108,9 +160,9 @@ async function main() {
   // gate silently never fires — so prove it here, on the real chain, before
   // the contract is whitelisted rather than after a blacklisted user gets
   // through.
-  if (REPUTATION_MANAGER !== ethers.ZeroAddress) {
+  if (rmAddr !== ethers.ZeroAddress) {
     const rm = new ethers.Contract(
-      REPUTATION_MANAGER,
+      rmAddr,
       ["function rmusers(address) view returns (uint256,uint256,bool)"],
       ethers.provider
     );
@@ -164,17 +216,37 @@ async function main() {
     console.log("     proves the constructor pinned what you passed, not that it was right.");
   }
   console.log(`  1. npx hardhat verify --network ${network.name} ${address} \\`);
-  console.log(`       ${DIAMOND_ADDRESS} ${USDC_ADDRESS} ${REPUTATION_MANAGER}`);
+  console.log(`       ${diamondAddr} ${usdcAddr} ${rmAddr}`);
   console.log("  2. File the whitelist request (docs/WHITELISTING.md):");
   console.log(`       network                = ${network.name}`);
   console.log(`       integrator             = ${address}`);
   console.log(`       proxyImpl              = ${proxyImpl}`);
   console.log("       usdcThroughIntegrator  = FALSE   <-- must be false");
+  console.log("       cancelCallbackEnabled  = TRUE    <-- must be true");
+  console.log("         onOrderCancel is the only callback that releases an in-flight");
+  console.log("         slot, and the Diamond does NOT call it by default - the flag is");
+  console.log("         opt-in per integrator. With it off, an order that expires");
+  console.log("         unaccepted holds its slot forever and the user is locked out");
+  console.log("         after inFlightCap of them. `reconcile(orderId)` recovers from");
+  console.log("         the chain's own status, so the flag is belt to that brace - but");
+  console.log("         ask for it anyway.");
   console.log("         The Diamond pays the order's recipientAddr, which userPlaceOrder");
   console.log("         sets to the user's pinned ramp wallet. TRUE would route every");
   console.log("         settlement through this contract, where a try/catch'd callback is");
   console.log("         all that would forward it — one failure strands user funds.");
   console.log(`       bytecodeHash           = ${runtimeBytecodeHash}`);
+  const cfg = await readConfig(diamondAddr, address).catch(() => null);
+  if (cfg) {
+    console.log("");
+    console.log("  Current registration as the Diamond sees it (expect all false/absent");
+    console.log("  until the whitelist request is actioned):");
+    console.log(`       words                  = ${cfg.words}`);
+    console.log(`       isActive               = ${cfg.isActive}`);
+    console.log(`       usdcThroughIntegrator  = ${cfg.usdcThroughIntegrator}  (must end FALSE)`);
+    console.log(
+      `       cancelCallbackEnabled  = ${cfg.cancelCallbackEnabled ?? "(not in this revision)"}  (want TRUE)`
+    );
+  }
   console.log("  3. Pin a ramp recipient per user BEFORE they can ramp:");
   console.log("       integrator.setRampRecipient(user, rampWallet)");
   console.log("     An unpinned user cannot place an order at all (NotRegistered), which is");

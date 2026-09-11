@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-pragma solidity ^0.8.20;
+// `transient` storage (EIP-1153) needs 0.8.28+, not 0.8.20.
+pragma solidity ^0.8.28;
 
 import { IP2PIntegrator } from "../../interfaces/IP2PIntegrator.sol";
 import { IB2BGateway } from "../../interfaces/IB2BGateway.sol";
@@ -83,6 +84,13 @@ contract HypeHouseRampIntegrator is IP2PIntegrator {
     error OverDailyCap(uint256 amount, uint256 cap);
     error TooManyInFlight(address user, uint256 inFlight, uint256 cap);
     error Reentrancy();
+    error OnlyRegistrar();
+    error AlreadyPinned(address user);
+    error RecipientIsUser(address user);
+    error CapExceedsCeiling(uint256 given, uint256 ceiling);
+    error RoutesThroughIntegrator();
+    error ConfigUnreadable();
+    error NotPending();
 
     // ─── Events ───────────────────────────────────────────────────────
     event RampRecipientSet(address indexed user, address indexed recipient);
@@ -99,18 +107,48 @@ contract HypeHouseRampIntegrator is IP2PIntegrator {
     event OrderCancelled(uint256 indexed orderId, address indexed user);
     event UserProxyDeployed(address indexed user, address proxy);
     event CapsUpdated(uint256 perTx, uint256 perDay, uint256 inFlight);
+    /// @notice A pin was REPLACED, not created. Separate from RampRecipientSet so
+    ///         an alert can page on this alone - it is the one action that
+    ///         redirects a user's future on-ramps.
+    event RampRecipientReset(address indexed user, address indexed from, address indexed to);
+    event RegistrarChanged(address indexed from, address indexed to);
+    event OwnerTransferStarted(address indexed from, address indexed to);
+    event OwnerTransferred(address indexed from, address indexed to);
+    event InFlightReset(address indexed user, uint256 from);
+    event OrderReconciled(uint256 indexed orderId, address indexed user, uint8 status);
+    event UsdcSwept(address indexed to, uint256 amount);
 
     // ─── Immutables ───────────────────────────────────────────────────
     address public immutable diamond;
     IERC20 public immutable usdc;
-    address public immutable owner;
+
+    /// @notice COLD key: caps, the registrar, re-pins, sweeps, ownership.
+    ///         Mutable and two-step transferable - an immutable owner on a
+    ///         contract that pins payout addresses is an un-rotatable hot key.
+    address public owner;
+    address public pendingOwner;
+    /// @notice HOT key, called on every signup. May pin an UNSET user and nothing
+    ///         else: if it leaks, the holder cannot redirect an existing user's
+    ///         on-ramps and cannot lift the caps to make it worth doing.
+    address public registrar;
     address public immutable proxyImpl;
     /// @notice ReputationManager, for the USER blacklist. Zero disables the
     ///         check - allowed only so tests and a pre-deploy environment can
     ///         run, never in production.
     IRmUserBlacklist public immutable reputationManager;
 
-    // ─── Caps (owner-settable) ────────────────────────────────────────
+    // ─── Ceilings (immutable) ─────────────────────────────────────────
+    // A whitelisted integrator bypasses the protocol's own RP, daily, monthly and
+    // yearly limits, so an owner-raisable cap is a PROTOCOL lever rather than
+    // partner config. Audit F1 on Investabl (#40) and Showdown (#35); Own,
+    // Showdown and Investabl all carry MAX_* constants. The #77 conformance
+    // ratchet missed this one because its regex matches set*(Limit|Cap|Bps)( and
+    // this setter is plural.
+    uint256 public constant MAX_PER_TX_USDC = 2_000e6;
+    uint256 public constant MAX_PER_DAY_USDC = 10_000e6;
+    uint256 public constant MAX_IN_FLIGHT = 10;
+
+    // ─── Caps (owner-settable, under the ceilings) ────────────────────
     uint256 public perTxCapUsdc = 500e6;
     uint256 public perDayCapUsdc = 2000e6;
     /// @notice Orders placed and not yet settled or cancelled. The fraud
@@ -153,13 +191,25 @@ contract HypeHouseRampIntegrator is IP2PIntegrator {
         _;
     }
 
+    /// @dev The owner is also a registrar, so a fresh deploy can provision before
+    ///      a separate hot key exists.
+    modifier onlyRegistrar() {
+        if (msg.sender != registrar && msg.sender != owner) revert OnlyRegistrar();
+        _;
+    }
+
     constructor(address _diamond, address _usdc, address _reputationManager) {
         if (_diamond == address(0) || _usdc == address(0)) revert InvalidAddress();
         diamond = _diamond;
         usdc = IERC20(_usdc);
         owner = msg.sender;
+        registrar = msg.sender;
         reputationManager = IRmUserBlacklist(_reputationManager);
         proxyImpl = address(new UserProxy());
+        // The defaults must themselves be legal, or the ceilings are decoration.
+        assert(perTxCapUsdc <= MAX_PER_TX_USDC);
+        assert(perDayCapUsdc <= MAX_PER_DAY_USDC);
+        assert(inFlightCap <= MAX_IN_FLIGHT);
     }
 
     // ─── Admin ────────────────────────────────────────────────────────
@@ -168,10 +218,74 @@ contract HypeHouseRampIntegrator is IP2PIntegrator {
     ///         provisioning, BEFORE the wallet is advertised as usable: a
     ///         wallet that exists unpinned simply cannot receive an on-ramp,
     ///         while a pin to an address that does not exist would strand funds.
-    function setRampRecipient(address user, address recipient) external onlyOwner {
+    function setRampRecipient(address user, address recipient) external onlyRegistrar {
         if (user == address(0) || recipient == address(0)) revert InvalidAddress();
+        // PIN ONCE. A registrar that can overwrite is a registrar that can
+        // redirect every future on-ramp of an existing user to an address it
+        // chooses - the user still pays the fiat. Re-pinning is a cold-key action
+        // with its own event, so an alert can page on it alone.
+        if (rampRecipientOf[user] != address(0)) revert AlreadyPinned(user);
+        // The recipient must not be the user's own signing wallet: on-ramped USDC
+        // has to land somewhere whose spending policy the app controls, and a
+        // user-controlled destination collapses the custody model silently.
+        if (recipient == user) revert RecipientIsUser(user);
         rampRecipientOf[user] = recipient;
         emit RampRecipientSet(user, recipient);
+    }
+
+    /// @notice Replace an existing pin. COLD key only, distinct event.
+    function resetRampRecipient(address user, address recipient) external onlyOwner {
+        if (user == address(0) || recipient == address(0)) revert InvalidAddress();
+        if (recipient == user) revert RecipientIsUser(user);
+        address from = rampRecipientOf[user];
+        rampRecipientOf[user] = recipient;
+        emit RampRecipientReset(user, from, recipient);
+    }
+
+    function setRegistrar(address next) external onlyOwner {
+        emit RegistrarChanged(registrar, next);
+        registrar = next;
+    }
+
+    /// @notice Two-step, so a typo cannot hand the contract to an address nobody
+    ///         controls. Passing address(0) cancels a pending transfer.
+    function transferOwnership(address next) external onlyOwner {
+        pendingOwner = next;
+        emit OwnerTransferStarted(owner, next);
+    }
+
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwner) revert NotPending();
+        emit OwnerTransferred(owner, pendingOwner);
+        owner = pendingOwner;
+        pendingOwner = address(0);
+    }
+
+    /**
+     * @notice Manual escape for a leaked in-flight slot.
+     *
+     *         `reconcile` is the normal path and needs no privilege. This exists
+     *         for the case reconcile cannot fix - an order id nobody recorded, or
+     *         a Diamond read that will not resolve - because the alternative is a
+     *         user permanently unable to place an order.
+     */
+    function resetInFlight(address user) external onlyOwner {
+        emit InFlightReset(user, inFlightOf[user]);
+        inFlightOf[user] = 0;
+    }
+
+    /**
+     * @notice Last resort for USDC that should never have arrived here.
+     *
+     *         With usdcThroughIntegrator = false nothing routes through this
+     *         contract, and `userPlaceOrder` refuses outright if the registration
+     *         is ever flipped - so a balance here means something went wrong
+     *         upstream. Without this the funds would be unrecoverable.
+     */
+    function sweepUsdc(address to, uint256 amount) external onlyOwner nonReentrant {
+        if (to == address(0)) revert InvalidAddress();
+        emit UsdcSwept(to, amount);
+        usdc.safeTransfer(to, amount);
     }
 
     function isRegistered(address user) external view returns (bool) {
@@ -179,6 +293,9 @@ contract HypeHouseRampIntegrator is IP2PIntegrator {
     }
 
     function setCaps(uint256 perTx, uint256 perDay, uint256 inFlight) external onlyOwner {
+        if (perTx > MAX_PER_TX_USDC) revert CapExceedsCeiling(perTx, MAX_PER_TX_USDC);
+        if (perDay > MAX_PER_DAY_USDC) revert CapExceedsCeiling(perDay, MAX_PER_DAY_USDC);
+        if (inFlight > MAX_IN_FLIGHT) revert CapExceedsCeiling(inFlight, MAX_IN_FLIGHT);
         perTxCapUsdc = perTx;
         perDayCapUsdc = perDay;
         inFlightCap = inFlight;
@@ -224,7 +341,19 @@ contract HypeHouseRampIntegrator is IP2PIntegrator {
         // directly (B2BGatewayFacet.sol:267). There is no balance here to
         // forward, nothing to strand if this reverts, and no custody to reason
         // about. All that is left is bookkeeping and the event.
-        if (inFlightOf[user] > 0) inFlightOf[user] -= 1;
+        //
+        // DECREMENT ONLY THIS ORDER'S OWN SLOT. CANCELLED -> PAID -> COMPLETED is
+        // a real BUY lifecycle (an admin re-opens a disputed order), and after a
+        // cancel has already released the row, an unconditional decrement here
+        // would free a slot belonging to a DIFFERENT in-flight order. Non-
+        // reverting either way: the Diamond's state is final and a revert here
+        // only loses the event.
+        if (orderUserOf[orderId] == user) {
+            if (inFlightOf[user] > 0) inFlightOf[user] -= 1;
+            delete orderUserOf[orderId];
+            delete orderAmountOf[orderId];
+            delete orderDayOf[orderId];
+        }
 
         emit RampSettled(orderId, user, amount, recipientAddr);
     }
@@ -275,6 +404,16 @@ contract HypeHouseRampIntegrator is IP2PIntegrator {
         _assertAllowed(user, amountUsdc);
 
         uint256 day = block.timestamp / 1 days;
+        // FAIL CLOSED ON A WRONG REGISTRATION. If this integrator is ever
+        // whitelisted with usdcThroughIntegrator = TRUE - which has happened to
+        // another integrator in production - settlement lands on this contract
+        // instead of the user's ramp wallet, and `onOrderComplete` would still
+        // emit RampSettled, so the app would credit a tranche to a user who never
+        // received the money. Refusing at placement means no such order can
+        // exist, so nothing can strand and nothing can be miscredited. The
+        // comments and the deploy-script warning are not a control.
+        if (_routesThroughIntegrator()) revert RoutesThroughIntegrator();
+
         // PROXY-AS-PLACER, and it is not optional: the B2B gateway is
         // proxy-only. The user's UserProxy is the msg.sender that calls
         // placeB2BOrder, and the gateway resolves that back to this integrator
@@ -293,8 +432,9 @@ contract HypeHouseRampIntegrator is IP2PIntegrator {
             IB2BGateway.placeB2BOrder,
             (user, amountUsdc, currency, recipient, pubKey, circleId, 0, 0)
         );
-        // usdcAllowance = 0: placeB2BOrder pulls nothing at placement. Payment
-        // settles off-chain and the Diamond pulls via the proxy at completion.
+        // usdcAllowance = 0: placeB2BOrder pulls nothing, at placement OR at
+        // completion. A BUY settles from the merchant's already-escrowed funds, so
+        // no USDC ever leaves the proxy on this path.
         // The orderId comes back through `execute`, which returns the call's
         // return data verbatim - the same way showdown reads it. An earlier
         // draft pre-read getNextOrderId() instead, on the belief that the return
@@ -321,7 +461,98 @@ contract HypeHouseRampIntegrator is IP2PIntegrator {
         emit OrderPlaced(orderId, user, amountUsdc);
     }
 
+    /**
+     * @notice Release an order's slot and daily debit from the CHAIN's own state.
+     *
+     *         THE REASON THIS EXISTS. `onOrderCancel` is the only other thing that
+     *         releases a row, and the Diamond does not reliably call it: in
+     *         contracts-v4 at the revision this was written against,
+     *         `onB2BOrderCancelled` decrements the gateway's own activeOrderCount
+     *         and emits, and never calls the integrator
+     *         (B2BGatewayFacet.sol:301-318) - while `onB2BOrderComplete` does call
+     *         onOrderComplete. Later revisions make it opt-in per integrator and
+     *         default OFF. Either way the in-flight slot of an order that expired
+     *         unaccepted, or that the user abandoned, is held forever; after
+     *         `inFlightCap` of those the user can never place again. Roughly half
+     *         of mainnet B2B BUY orders end CANCELLED, so that is the common case.
+     *
+     *         PERMISSIONLESS, because it grants nothing: the status comes from the
+     *         Diamond and the row it releases is the one the Diamond names.
+     *         Idempotent - an unknown or already-released id is a no-op.
+     */
+    function reconcile(uint256 orderId) external {
+        address user = orderUserOf[orderId];
+        if (user == address(0)) return; // unknown, or already released
+
+        (address onChainUser, uint8 status) = _orderUserAndStatus(orderId);
+        // SELF-CHECKING POSITIONAL READ. `status` sits at a fixed index in the
+        // returned tuple's head whatever the strings contain, but a member
+        // inserted upstream BEFORE it would shift both fields together - so the
+        // user must agree, or this reverts rather than releasing the wrong row.
+        if (onChainUser != user) revert ConfigUnreadable();
+        // 3 = COMPLETED, 4 = CANCELLED (OrderProcessorStorage.OrderStatus).
+        if (status != 3 && status != 4) return; // still live; nothing to release
+
+        uint256 amount = orderAmountOf[orderId];
+        uint256 day = orderDayOf[orderId];
+        if (status == 4) {
+            // A cancel refunds the day's debit. A completion does not: the money
+            // moved, and the daily cap is about volume placed.
+            if (dailySpentOf[user][day] >= amount) dailySpentOf[user][day] -= amount;
+            else dailySpentOf[user][day] = 0;
+        }
+        if (inFlightOf[user] > 0) inFlightOf[user] -= 1;
+
+        delete orderUserOf[orderId];
+        delete orderAmountOf[orderId];
+        delete orderDayOf[orderId];
+
+        emit OrderReconciled(orderId, user, status);
+    }
+
     // ─── Internal ─────────────────────────────────────────────────────
+
+    /**
+     * @dev Is this integrator registered to receive USDC itself?
+     *
+     *      Raw staticcall and word 1, not a typed decode. IntegratorConfig is
+     *      `{bool isActive, bool usdcThroughIntegrator, uint256 activeOrderCount,
+     *      address proxyImpl}` - all static, so word 1 is the flag and STAYS word
+     *      1 even when the struct gains members at the end, which mainnet's has.
+     *      A typed decode against a mirrored struct would revert on that change
+     *      instead, turning an upstream addition into an outage.
+     */
+    function _routesThroughIntegrator() internal view returns (bool) {
+        (bool ok, bytes memory out) = diamond.staticcall(
+            abi.encodeWithSignature("getIntegratorConfig(address)", address(this))
+        );
+        if (!ok || out.length < 64) revert ConfigUnreadable();
+        uint256 word1;
+        assembly {
+            word1 := mload(add(out, 0x40))
+        }
+        return word1 != 0;
+    }
+
+    /// @dev (user, status) from the Diamond's order. See reconcile for why the
+    ///      positional read is safe and how it self-checks.
+    function _orderUserAndStatus(uint256 orderId) internal view returns (address, uint8) {
+        (bool ok, bytes memory out) = diamond.staticcall(
+            abi.encodeWithSignature("getOrdersById(uint256)", orderId)
+        );
+        // offset word + 12 head words is the minimum that can contain `status`.
+        if (!ok || out.length < 0x1a0) revert ConfigUnreadable();
+        uint256 userWord;
+        uint256 statusWord;
+        assembly {
+            // out points at the length; data starts at 0x20. The returned tuple is
+            // dynamic, so data[0] is an offset (0x20) and the head begins at 0x40.
+            // user is head index 6, status is head index 11.
+            userWord := mload(add(out, add(0x40, mul(6, 0x20))))
+            statusWord := mload(add(out, add(0x40, mul(11, 0x20))))
+        }
+        return (address(uint160(userWord)), uint8(statusWord));
+    }
 
     /// @dev One gate, called from both `userPlaceOrder` and `validateOrder`, so
     ///      the front-run path and the Diamond's callback can never disagree.

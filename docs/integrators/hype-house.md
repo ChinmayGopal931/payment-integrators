@@ -53,6 +53,79 @@ An early draft did register `true`, sweep the `UserProxy`, and forward — which
 also needed an unclaimed ledger and a recovery path to be safe. All of that
 existed only because of the flag.
 
+## ⚠️ `cancelCallbackEnabled` MUST be true, and is not what keeps this safe
+
+`onOrderCancel` is the only callback that releases an in-flight slot and refunds
+the day's debit — and **the Diamond does not reliably call it.** At the
+contracts-v4 revision this was written against, `onB2BOrderCancelled`
+(`B2BGatewayFacet.sol:301-318`) decrements the gateway's own `activeOrderCount`
+and emits, and never touches the integrator, while `onB2BOrderComplete` at `:278`
+*does* call `onOrderComplete`. Later revisions add
+`setIntegratorCancelCallback(address,bool)` — **opt-in per integrator, default
+off**; this repo's own `MockDiamond` reports `cancelCallbackEnabled = false`.
+
+With it off, an order that expires because no merchant accepted it, or that the
+user abandoned, holds its slot forever. After `inFlightCap` of those the user can
+never place again. Roughly half of mainnet B2B BUY orders end CANCELLED, so that
+is the ordinary case and not an edge.
+
+So **ask for the flag in the whitelist request** — and do not depend on it.
+`reconcile(uint256 orderId)` below recovers from the chain's own status, which is
+what actually makes the accounting sound.
+
+## `reconcile(orderId)` — permissionless, chain-sourced
+
+Reads the order's `status` and `user` from the Diamond and releases the row when
+it is COMPLETED or CANCELLED. A cancel refunds the day's debit; a completion does
+not, because the money moved and the daily cap is about volume placed.
+
+Permissionless because it grants nothing: the status comes from the Diamond and
+the row released is the one the Diamond names. Idempotent, and a no-op for an
+unknown id or an order still live.
+
+It reads positionally — `user` at head index 6, `status` at index 11 — and
+**self-checks**: if the decoded user disagrees with the recorded one it reverts
+rather than releasing, so a member inserted upstream before `status` fails loud
+instead of freeing the wrong row.
+
+`resetInFlight(user)` is the cold-key escape for the case reconcile cannot reach.
+
+## The key model
+
+| Role | Heat | May |
+|---|---|---|
+| `registrar` | hot, called on every signup | pin an **unset** user, and nothing else |
+| `owner` | cold | set the registrar and the caps, re-pin, sweep, transfer ownership |
+
+`setRampRecipient` pins **once**. A registrar that could overwrite could redirect
+every future on-ramp of an existing user to an address it chose — and the user
+would still pay the fiat. Re-pinning is `resetRampRecipient`, cold-key only, with
+its own `RampRecipientReset` event so an alert can page on that alone.
+
+A recipient equal to the user is refused: on-ramped USDC has to land somewhere
+whose spending policy the app controls, and a user-controlled destination
+collapses the custody model silently.
+
+Ownership transfers in two steps with a zero-address cancel, so a typo cannot hand
+the contract to an address nobody holds.
+
+## A wrong registration cannot be survived
+
+`userPlaceOrder` reads `getIntegratorConfig(address(this))` and **reverts** if
+`usdcThroughIntegrator` is true. If this were ever whitelisted that way — which
+has happened to another integrator in production — settlement would land here
+instead of the user's ramp wallet, while `onOrderComplete` still emitted
+`RampSettled`, so the app would credit a tranche to somebody who never received
+the money. Refusing at placement means no such order can exist.
+
+The read is a raw staticcall taking word 1, not a typed decode:
+`IntegratorConfig` is all-static, so the flag is word 1 and stays word 1 when the
+struct gains members at the end — which mainnet's has. A mirrored-struct decode
+would revert on that addition instead, turning an upstream change into an outage.
+
+`sweepUsdc(to, amount)` is the owner's last resort for anything that lands anyway;
+without it such funds would be unrecoverable.
+
 ## The order lifecycle
 
 | Hook | What it does |
@@ -106,6 +179,14 @@ which slot the gate reads — and the failure mode is a gate that never fires.
 | `perTxCapUsdc` | 500 USDC | — |
 | `perDayCapUsdc` | 2000 USDC | — |
 | `inFlightCap` | 3 orders | The fraud engine's `b2b_inflight_limit` is off-chain and skippable by a scripted order; this is not. |
+
+Each cap is bounded by an immutable ceiling — `MAX_PER_TX_USDC`,
+`MAX_PER_DAY_USDC`, `MAX_IN_FLIGHT` — and the constructor asserts its own defaults
+are under them. A whitelisted integrator bypasses the protocol's own RP, daily,
+monthly and yearly limits, so an owner-raisable cap is a protocol lever rather
+than partner config (audit F1 on Investabl #40 and Showdown #35). Note the #77
+conformance ratchet does **not** catch this: its regex matches
+`set*(Limit|Cap|Bps)(` and this setter is plural, so it reports "not applicable".
 | `cancelCountOf` | — | Every cancel permanently costs one in-flight slot, floored at one. The engine's `rapid_cancellations_b2b` restriction is per-wallet and expires after four hours, and the 2026-09-08 blacklist-bypass case records a seed wallet simply resuming after each one. |
 
 Caps are owner-settable; the cancel penalty is not resettable by design.
@@ -131,7 +212,8 @@ nowhere to land.
 
 ## Tests
 
-`test/hype-house-integrator.test.ts` — 24 cases. The ones worth reading first:
+`test/hype-house-integrator.test.ts` — 45 cases, branch coverage 83%. The ones
+worth reading first:
 
 - *pays the PINNED recipient, not the address the Diamond passes*
 - *has no entry point that accepts a recipient* — an ABI assertion, so adding an
@@ -142,6 +224,20 @@ nowhere to land.
 - *NEVER holds user money, so a failed callback cannot strand any*
 - *decodes the THIRD return of rmusers, not the first two*
 - *TIGHTENS the in-flight cap, permanently* / *never tightens below one slot*
+- *releases the slot and refunds the day when the chain says CANCELLED* — driven
+  through `simulateOrderCancelledNoCallback`, which models what the real Diamond
+  does rather than what an integrator would like it to do
+- *REFUSES to place an order when routed through the integrator*
+- *pins ONCE: the hot key cannot redirect an existing user*
+
+**Outstanding product decision.** `cancelCountOf` permanently shrinks a user's
+in-flight cap, and on the Diamond a BUY can be cancelled by the user, an admin, or
+the keeper on expiry. An order no merchant accepts is keeper-cancelled, so an
+honest user loses a slot having done nothing, and with a cap of 3 is down to one
+after two such events. The behaviour this targets — a seed wallet that keeps
+placing — is better handled by the registration gate and the blacklist. Needs
+sign-off; if it stays, it wants a time decay or to count only user-initiated
+cancels.
 
 One bug the tests found rather than the design: placement double-counted itself.
 The Diamond calls `validateOrder` *during* `userPlaceOrder`, and that runs the
