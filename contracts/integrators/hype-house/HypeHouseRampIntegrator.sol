@@ -86,7 +86,6 @@ contract HypeHouseRampIntegrator is IP2PIntegrator {
     error Reentrancy();
     error OnlyRegistrar();
     error AlreadyPinned(address user);
-    error RecipientIsUser(address user);
     error CapExceedsCeiling(uint256 given, uint256 ceiling);
     error RoutesThroughIntegrator();
     error ConfigUnreadable();
@@ -225,10 +224,33 @@ contract HypeHouseRampIntegrator is IP2PIntegrator {
         // chooses - the user still pays the fiat. Re-pinning is a cold-key action
         // with its own event, so an alert can page on it alone.
         if (rampRecipientOf[user] != address(0)) revert AlreadyPinned(user);
-        // The recipient must not be the user's own signing wallet: on-ramped USDC
-        // has to land somewhere whose spending policy the app controls, and a
-        // user-controlled destination collapses the custody model silently.
-        if (recipient == user) revert RecipientIsUser(user);
+        // A SELF-PIN IS ALLOWED, and that is a deliberate reversal.
+        //
+        // This used to `revert RecipientIsUser(user)` when recipient == user, on
+        // the reasoning that on-ramped USDC must land somewhere whose spending
+        // policy the app controls and a user-controlled destination collapses the
+        // custody model. The invariant is right; `recipient != user` was a proxy
+        // for it that INVERTS in the integration this contract was written for.
+        //
+        // hype.house signs `userPlaceOrder` from the user's policy-locked ramp
+        // wallet, so `msg.sender` - and therefore `user` here - already IS the
+        // app-controlled wallet, and is also the correct recipient. The old check
+        // made the only configuration this integrator has unpinnable: proven by
+        // setRampRecipient(w, w) reverting, which is what the app needs to call.
+        //
+        // What actually enforces the invariant is that pinning is REGISTRAR-ONLY.
+        // A user cannot pin themselves, so they cannot name their own wallet as a
+        // destination; only the server can, and the server only ever names a wallet
+        // it provisioned under a Privy policy. A compromised registrar could
+        // already pin any unset user to any address, so permitting the self-pin
+        // adds nothing to that case.
+        //
+        // NOTE for anyone auditing the blacklist: because `user` is a freshly
+        // minted per-user wallet, `_assertAllowed`'s rmusers() check can never
+        // match, so the on-chain blacklist is VACUOUS for this integration. That
+        // was already true before this change - it follows from who signs, not from
+        // this check - and it must not be counted as a control. The caps are keyed
+        // per ramp wallet, which is 1:1 with a user, so those still bind.
         rampRecipientOf[user] = recipient;
         emit RampRecipientSet(user, recipient);
     }
@@ -236,7 +258,8 @@ contract HypeHouseRampIntegrator is IP2PIntegrator {
     /// @notice Replace an existing pin. COLD key only, distinct event.
     function resetRampRecipient(address user, address recipient) external onlyOwner {
         if (user == address(0) || recipient == address(0)) revert InvalidAddress();
-        if (recipient == user) revert RecipientIsUser(user);
+        // Same reversal as setRampRecipient, for the same reason - and this path is
+        // cold-key only, so it is the stricter of the two to begin with.
         address from = rampRecipientOf[user];
         rampRecipientOf[user] = recipient;
         emit RampRecipientReset(user, from, recipient);

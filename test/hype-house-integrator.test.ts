@@ -139,6 +139,24 @@ describe("HypeHouseRampIntegrator", function () {
       expect(order.recipientAddr).to.not.equal(ethers.ZeroAddress);
     });
 
+    it("works end to end in hype.house's ACTUAL configuration: one wallet, self-pinned", async function () {
+      // The whole point of relaxing the self-pin check. The relay signs
+      // userPlaceOrder from the policy-locked ramp wallet, so placer == recipient.
+      // This asserts the order that results pays that same wallet - i.e. that the
+      // configuration is not merely pinnable but correct.
+      await integrator.setRampRecipient(rampWallet.address, rampWallet.address);
+      await integrator.connect(rampWallet).userPlaceOrder(USDC(25), INR, 0, "pk");
+      const order = await mockDiamond.getOrdersById(1);
+      expect(order.recipientAddr).to.equal(rampWallet.address);
+      // order.user is the RAMP WALLET, not the UserProxy - the proxy is only the
+      // msg.sender the gateway authenticates, while `user` is the argument
+      // placeB2BOrder records. Worth pinning: hype.house's off-ramp gate
+      // (isSettledSell) matches an order's `user` against the stored ramp wallet,
+      // so if this were the proxy address that check would refuse every order.
+      expect(order.user).to.equal(rampWallet.address);
+      expect(order.recipientAddr).to.not.equal(ethers.ZeroAddress);
+    });
+
     it("rejects a settlement callback from anyone but the Diamond", async function () {
       await register();
       await expect(
@@ -504,12 +522,35 @@ describe("HypeHouseRampIntegrator", function () {
       ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
     });
 
-    it("refuses to pin a user's own address as their recipient", async function () {
-      // On-ramped USDC has to land somewhere whose spending policy the app
-      // controls; a user-controlled destination collapses the custody model.
+    it("ALLOWS a self-pin, because that is the configuration hype.house has", async function () {
+      // This used to revert RecipientIsUser, on the reasoning that on-ramped USDC
+      // must land somewhere whose spending policy the app controls. The invariant
+      // is right; the check was a proxy for it that inverts here.
+      //
+      // hype.house signs userPlaceOrder from the user's POLICY-LOCKED RAMP WALLET,
+      // so msg.sender - the `user` in this mapping - already IS the app-controlled
+      // wallet, and is also the right recipient. The old check therefore made the
+      // only configuration this integrator has unpinnable, which is how it was
+      // found: setRampRecipient(w, w) reverted, and that is the exact call the
+      // server has to make.
+      //
+      // Safe because pinning is REGISTRAR-ONLY: a user cannot name their own wallet
+      // as a destination, only the server can, and it only ever names a wallet it
+      // provisioned under a Privy policy. The test below this one is what holds
+      // that line.
+      await expect(integrator.setRampRecipient(rampWallet.address, rampWallet.address))
+        .to.emit(integrator, "RampRecipientSet")
+        .withArgs(rampWallet.address, rampWallet.address);
+      expect(await integrator.rampRecipientOf(rampWallet.address)).to.equal(rampWallet.address);
+    });
+
+    it("...and a USER still cannot pin themselves, which is what keeps it safe", async function () {
+      // The whole safety of allowing a self-pin rests on pinning being privileged.
+      // If this ever passes, on-ramped USDC can be directed to a wallet whose
+      // spending policy nobody controls.
       await expect(
-        integrator.setRampRecipient(user.address, user.address)
-      ).to.be.revertedWithCustomError(integrator, "RecipientIsUser");
+        integrator.connect(user).setRampRecipient(user.address, user.address)
+      ).to.be.revertedWithCustomError(integrator, "OnlyRegistrar");
     });
 
     it("lets a delegated registrar pin, and nothing else", async function () {
