@@ -1,7 +1,23 @@
 # HypeHouseRampIntegrator
 
 Fiat **on-ramp** for hype.house, a Solana spot + Hyperliquid perps trading app.
-Not deployed yet — awaiting whitelisting.
+**Live on Base mainnet, registered 2026-09-14.**
+
+| | |
+|---|---|
+| integrator | `0x0C801676d278F21a93F876c691a76b75826C622e` |
+| proxyImpl | `0x728a4D8abB4a7Cc0bB8c330D7Eee1bC6FEFB4CDc` |
+| owner / registrar | `0xeAdbF32D78247229881eA3701Ae49E2513859CdE` |
+| caps | 500 / 2000 USDC, 3 in flight |
+
+Verified on-chain after registration: `isActive` true, **`usdcThroughIntegrator`
+false**, **`cancelCallbackEnabled` true**, and the `proxyImpl` the Diamond holds
+matches the contract's own — so the gateway's CREATE2 re-derivation resolves.
+Those are the four that decide whether settlement reaches the user.
+
+Two things still open: **owner and registrar are the same address**, which
+collapses the hot/cold split this contract is built around (`setRegistrar` fixes
+it), and the contract is **not yet verified on Basescan**.
 
 `contracts/integrators/hype-house/HypeHouseRampIntegrator.sol`
 
