@@ -22,10 +22,10 @@ import { getIntegratorConfig } from "./lib/diamond";
  *     $20 per tx, 5 orders/day per wallet
  *
  * Both numbers are ALSO immutable MAX_* constants in the bytecode. The
- * constructor and the owner's setters can only ever go at or below them, so the
- * policy holds against a compromised owner key as well as a compromised
- * attestor key. Pass lower values to launch tighter; the owner can lower
- * further later, never raise.
+ * constructor and the owner's setters can only ever go at or below them, so no
+ * per-wallet limit can exceed policy whoever holds the owner key. Pass lower
+ * values to launch tighter; the owner can move a limit anywhere up to its
+ * ceiling later.
  *
  * ── The attestor ──────────────────────────────────────────────────────────
  * `ATTESTOR` is the secp256k1 signer of the simple-kyc liveness service. It

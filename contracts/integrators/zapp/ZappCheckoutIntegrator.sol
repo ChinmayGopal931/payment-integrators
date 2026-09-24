@@ -49,12 +49,20 @@ import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
  *         The effective per-tx cap is `min(attested limit, livenessTierCap)`,
  *         so a compromised attestor key cannot authorize more than policy.
  *
- *         Both numbers are ALSO immutable `MAX_*` constants in the bytecode.
- *         `setLivenessTierCap` and `setDailyTxCountLimit` can only ever move
- *         a limit DOWN. The policy therefore holds against a compromised
- *         OWNER key, not merely a compromised attestor — which matters
- *         because a whitelisted integrator that could raise its own caps is a
- *         risk to the protocol, not just to Zapp.
+ *         Both numbers are ALSO immutable `MAX_*` constants in the bytecode,
+ *         and `setLivenessTierCap` / `setDailyTxCountLimit` check against
+ *         them. No limit can exceed its ceiling, whoever holds the OWNER key
+ *         — which matters because a whitelisted integrator that could raise
+ *         its own caps is a risk to the protocol, not just to Zapp. Below the
+ *         ceiling a limit moves freely, so a cap lowered in an incident can be
+ *         restored.
+ *
+ *         The ceilings bound each wallet, not the number of wallets. An owner
+ *         that points the attestor at a key of its own can sign grants for
+ *         any number of fresh wallets, so owner compromise is a superset of
+ *         attestor compromise and the owner must be a multisig. Ownership is
+ *         two-step and transferable, and every attestor rotation is public
+ *         for `ATTESTOR_ROTATION_DELAY` before it takes effect.
  *
  *         ── Verification is the on-chain twin of simple-kyc ──────────────
  *         EIP-712 typehash `LivenessAttestation(address wallet,bytes32
@@ -170,8 +178,8 @@ contract ZappCheckoutIntegrator is IP2PIntegrator, Ownable2Step {
 
     // ─── Immutable policy ceilings ────────────────────────────────────
     // Compiled into the bytecode. Nothing — owner included — can move them.
-    // The setters check against these, so the deployed contract can only ever
-    // become MORE restrictive than launch policy, never less.
+    // The setters check against these, so no limit can ever be set looser
+    // than launch policy.
 
     /// @notice Liveness tier — $20 per tx, and the most `setLivenessTierCap`
     ///         can ever be set to.
@@ -203,7 +211,7 @@ contract ZappCheckoutIntegrator is IP2PIntegrator, Ownable2Step {
     ///         Pinned on the Diamond at registration and set-once there.
     address public immutable proxyImpl;
 
-    // ─── Mutable policy (tightening only) ─────────────────────────────
+    // ─── Mutable policy (bounded by the ceilings) ─────────────────────
 
     /// @notice secp256k1 signer of the liveness service's attestations
     ///         (simple-kyc liveness verifier, `GET /v1/attestor`).
@@ -284,7 +292,8 @@ contract ZappCheckoutIntegrator is IP2PIntegrator, Ownable2Step {
     /**
      * @param _diamond      P2P Diamond proxy for the target network.
      * @param _usdc         USDC the Diamond settles in on that network.
-     * @param _owner        Operator key: pause, denylist, tighten limits.
+     * @param _owner        Operator key: pause, denylist, limits within the
+     *                      ceilings, attestor rotation.
      *                      Transferable later, two-step: `transferOwnership`
      *                      names a pending owner, who must `acceptOwnership`
      *                      from their own key. `renounceOwnership` is
@@ -322,7 +331,7 @@ contract ZappCheckoutIntegrator is IP2PIntegrator, Ownable2Step {
         proxyImpl = address(new UserProxy());
     }
 
-    // ─── Administration (tightening + emergency only) ─────────────────
+    // ─── Administration ───────────────────────────────────────────────
 
     /**
      * @notice Propose a new attestation signer. It takes effect only through
@@ -371,11 +380,11 @@ contract ZappCheckoutIntegrator is IP2PIntegrator, Ownable2Step {
     }
 
     /**
-     * @notice Lower the per-tx cap. Setting it to 0 halts new orders without
+     * @notice Set the per-tx cap. Setting it to 0 halts new orders without
      *         touching anyone's attestation.
-     * @dev    Can only ever set a value AT OR BELOW the immutable
-     *         `MAX_LIVENESS_TIER_CAP` — the owner may tighten policy, never
-     *         loosen it.
+     * @dev    Never above the immutable `MAX_LIVENESS_TIER_CAP`. Below it the
+     *         cap moves in either direction, so a cap lowered in an incident
+     *         can be restored without redeploying.
      */
     function setLivenessTierCap(uint256 cap) external onlyOwner {
         _setLivenessTierCap(cap);

@@ -96,11 +96,15 @@ uint256 public constant MAX_LIVENESS_TIER_CAP = 20e6;   // $20
 uint256 public constant MAX_DAILY_TX_COUNT_LIMIT = 5;
 ```
 
-`setLivenessTierCap` and `setDailyTxCountLimit` check against these, so they can
-only ever move a limit **down**. The policy therefore holds against a
-compromised **owner** key, not just a compromised attestor — a whitelisted
-integrator that can raise its own caps is a risk to the protocol, not just to
-Zapp. A deploy may launch tighter than policy; it can never launch looser.
+`setLivenessTierCap` and `setDailyTxCountLimit` check against these, so no
+limit can ever exceed its ceiling, whoever holds the owner key. Below the
+ceiling a limit moves freely in both directions, so a cap lowered during an
+incident can be restored without redeploying. The guarantee is the ceiling, not
+monotonicity. A deploy may launch tighter than policy; it can never launch
+looser.
+
+The ceilings bound each wallet, not the number of wallets. That aggregate is
+what the owner key can still reach, through the attestor — see §4.
 
 ### Attestation binding
 
@@ -132,18 +136,35 @@ is the lever for revoking a wallet.
 
 ## 4. Owner powers (the complete list)
 
-| function               | effect                                          | bounded by                         |
-| ---------------------- | ----------------------------------------------- | ---------------------------------- |
-| `setAttestor`          | rotate the service signer                       | — (does not touch existing grants) |
-| `setLivenessTierCap`   | lower the per-tx cap; `0` halts new orders      | `MAX_LIVENESS_TIER_CAP`            |
-| `setDailyTxCountLimit` | lower placements/day; `0` rejected              | `MAX_DAILY_TX_COUNT_LIMIT`         |
-| `setBlocked`           | denylist a wallet (sanctions / confirmed fraud) | —                                  |
-| `pause` / `unpause`    | halt all placement and validation               | —                                  |
-| `sweepUsdc`            | recover stray tokens sent here by mistake       | —                                  |
+| function                                      | effect                                                                  | bounded by                                                |
+| --------------------------------------------- | ----------------------------------------------------------------------- | --------------------------------------------------------- |
+| `setPendingAttestor` → `applyPendingAttestor` | rotate the service signer; the new key takes effect 48 h after proposal | `ATTESTOR_ROTATION_DELAY`; `0` rejected; grants untouched |
+| `cancelPendingAttestor`                       | withdraw a proposed rotation                                            | —                                                         |
+| `setLivenessTierCap`                          | set the per-tx cap; `0` halts new orders                                | `MAX_LIVENESS_TIER_CAP`                                   |
+| `setDailyTxCountLimit`                        | set placements/day; `0` rejected                                        | `MAX_DAILY_TX_COUNT_LIMIT`                                |
+| `setBlocked`                                  | denylist a wallet (sanctions / confirmed fraud)                         | —                                                         |
+| `pause` / `unpause`                           | halt all placement and validation                                       | —                                                         |
+| `sweepUsdc`                                   | recover stray tokens sent here by mistake                               | —                                                         |
+| `transferOwnership` → `acceptOwnership`       | hand the owner role to another key, e.g. a multisig                     | the new owner must accept; `renounceOwnership` disabled   |
 
-The owner **cannot** raise a limit, mint a grant, move a user's funds, redirect
-settlement, or upgrade the contract. There is no proxy, no `delegatecall`, and
-no `selfdestruct`.
+The owner **cannot** raise a limit past its ceiling, move a user's funds,
+redirect settlement, or upgrade the contract. There is no proxy, no
+`delegatecall`, and no `selfdestruct`.
+
+The owner **can** mint grants, indirectly. The attestor decides who is verified,
+so an owner that points it at a key of its own can sign attestations for any
+number of fresh wallets, each good for $20 per order and 5 orders a day. Two
+things constrain that:
+
+- **Every rotation is public for 48 hours before it takes effect.**
+  `setPendingAttestor` emits `AttestorProposed(attestor, readyAt)`, and nothing
+  changes until `applyPendingAttestor` after `readyAt`. That is the window for
+  anyone watching to flag it and for P2P to `deactivateIntegrator`. The delay
+  makes a rotation visible; it does not prevent one.
+- **The owner is a multisig.** Owner compromise is a superset of attestor
+  compromise. Ownership is `Ownable2Step`, so it can move to a new key without
+  redeploying, and `scripts/deploy-zapp.ts` refuses a mainnet `DEPLOY_OWNER`
+  that has no contract code.
 
 ## 5. Order lifecycle
 
@@ -193,7 +214,9 @@ decimals, and both ceilings before spending gas, then asserts
 
 ## 8. Launch dependencies
 
-- [ ] Liveness attestor key, read from the service's own `GET /v1/attestor`
+- [ ] Liveness attestor key, read from the service's own `GET /v1/attestor`,
+      passed at deploy (a later rotation takes 48 hours)
+- [ ] Zapp multisig as `DEPLOY_OWNER`
 - [ ] This contract's address registered as the tenant `contract_address` with
       the liveness service
 - [ ] Whitelist request approved and `registerIntegrator` executed with
@@ -209,3 +232,5 @@ decimals, and both ceilings before spending gas, then asserts
 - The contract's USDC balance should be zero at all times. A non-zero balance
   means a stray transfer or a mis-registration; check for
   `SettlementRoutingAnomaly` before sweeping.
+- Watch for `AttestorProposed`. An unexpected one is the 48-hour warning that
+  the owner key is pointing the attestor somewhere new.
