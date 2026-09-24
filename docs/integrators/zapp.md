@@ -143,7 +143,7 @@ is the lever for revoking a wallet.
 | `setLivenessTierCap`                          | set the per-tx cap; `0` halts new orders                                | `MAX_LIVENESS_TIER_CAP`                                   |
 | `setDailyTxCountLimit`                        | set placements/day; `0` rejected                                        | `MAX_DAILY_TX_COUNT_LIMIT`                                |
 | `setBlocked`                                  | denylist a wallet (sanctions / confirmed fraud)                         | —                                                         |
-| `pause` / `unpause`                           | halt all placement and validation                                       | —                                                         |
+| `pause` / `unpause`                           | halt new verifications, placement and validation                        | —                                                         |
 | `sweepUsdc`                                   | recover stray tokens sent here by mistake                               | —                                                         |
 | `transferOwnership` → `acceptOwnership`       | hand the owner role to another key, e.g. a multisig                     | the new owner must accept; `renounceOwnership` disabled   |
 
@@ -234,3 +234,7 @@ decimals, and both ceilings before spending gas, then asserts
   `SettlementRoutingAnomaly` before sweeping.
 - Watch for `AttestorProposed`. An unexpected one is the 48-hour warning that
   the owner key is pointing the attestor somewhere new.
+- Rotating away from a leaked attestor key takes the same 48 hours. Pause for
+  the window: pause stops new verifications as well as orders, so nothing the
+  old key signs lands. Wallets it verified before the pause can be stopped with
+  `setBlocked`.

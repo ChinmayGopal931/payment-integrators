@@ -763,6 +763,18 @@ describe("ZappCheckoutIntegrator", function () {
         .reverted;
     });
 
+    it("refuses new verifications while paused", async function () {
+      await integrator.connect(owner).pause();
+      await expect(verify(user, TIER_CAP)).to.be.revertedWithCustomError(
+        integrator,
+        "ContractPaused"
+      );
+      expect(await integrator.verified(user.address)).to.equal(false);
+
+      await integrator.connect(owner).unpause();
+      await expect(verify(user, TIER_CAP)).to.emit(integrator, "LivenessVerified");
+    });
+
     it("refuses to validate while paused", async function () {
       await verify(user, TIER_CAP);
       await integrator.connect(owner).pause();

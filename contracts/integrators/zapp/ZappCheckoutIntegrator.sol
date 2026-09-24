@@ -473,6 +473,11 @@ contract ZappCheckoutIntegrator is IP2PIntegrator, Ownable2Step {
      *      because the nullifier is single-use, so an expired grant could
      *      never be re-claimed anyway — and `setBlocked` is the lever for
      *      revoking a wallet.
+     *
+     *      Paused stops new verifications as well as new orders. Rotating
+     *      away from a leaked attestor key takes `ATTESTOR_ROTATION_DELAY`
+     *      like any other rotation, and pausing for that window is what keeps
+     *      anything the old key signs from landing.
      */
     function submitLivenessAttestation(
         bytes32 nullifier,
@@ -480,6 +485,7 @@ contract ZappCheckoutIntegrator is IP2PIntegrator, Ownable2Step {
         uint256 expiry,
         bytes calldata signature
     ) external {
+        if (paused) revert ContractPaused();
         address signer = attestor;
         if (signer == address(0)) revert AttestorNotSet();
         if (block.timestamp >= expiry) revert AttestationExpired();
