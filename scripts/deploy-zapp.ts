@@ -36,7 +36,9 @@ import { getIntegratorConfig } from "./lib/diamond";
  *
  * On Base Sepolia, ATTESTOR defaults to the DEPLOYER so an end-to-end script
  * can mint test attestations locally. That is a testnet-only placeholder —
- * rotate with `setAttestor` before anything real.
+ * rotate it before anything real. Rotation is two calls 48 hours apart
+ * (`setPendingAttestor`, then `applyPendingAttestor`), so pass the real
+ * signer here rather than planning to fix it later.
  *
  * ── The owner ─────────────────────────────────────────────────────────────
  * `DEPLOY_OWNER` defaults to the deployer on testnet. On mainnet it is required
@@ -141,8 +143,9 @@ async function main() {
     ATTESTOR = deployer.address;
     console.log(
       "\n⚠️  ATTESTOR unset — defaulting to the DEPLOYER for testnet so an E2E\n" +
-        "    script can sign attestations locally. Rotate with setAttestor(A)\n" +
-        "    to the real service signer before any real traffic."
+        "    script can sign attestations locally. Rotate to the real service\n" +
+        "    signer (setPendingAttestor, then applyPendingAttestor 48h later)\n" +
+        "    before any real traffic."
     );
   }
   if (!ethers.isAddress(ATTESTOR)) throw new Error(`ATTESTOR is not an address: ${ATTESTOR}`);

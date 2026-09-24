@@ -32,14 +32,23 @@ describe("ZappCheckoutIntegrator", function () {
   // Launch policy. Each is also an immutable MAX_* ceiling in the contract.
   const TIER_CAP = USDC(20);
   const DAILY_COUNT = 5;
+  const ROTATION_DELAY = 48n * 3600n;
 
   function nullifierFor(label: string): string {
     return ethers.keccak256(ethers.toUtf8Bytes(label));
   }
 
-  async function futureExpiry(secondsAhead = 3600): Promise<bigint> {
+  async function latestTimestamp(): Promise<bigint> {
     const block = await ethers.provider.getBlock("latest");
-    return BigInt(block!.timestamp) + BigInt(secondsAhead);
+    return BigInt(block!.timestamp);
+  }
+
+  async function setNextBlockTimestamp(timestamp: bigint) {
+    await ethers.provider.send("evm_setNextBlockTimestamp", [Number(timestamp)]);
+  }
+
+  async function futureExpiry(secondsAhead = 3600): Promise<bigint> {
+    return (await latestTimestamp()) + BigInt(secondsAhead);
   }
 
   /**
@@ -344,6 +353,7 @@ describe("ZappCheckoutIntegrator", function () {
     it("exposes the ceilings as constants", async function () {
       expect(await integrator.MAX_LIVENESS_TIER_CAP()).to.equal(USDC(20));
       expect(await integrator.MAX_DAILY_TX_COUNT_LIMIT()).to.equal(5);
+      expect(await integrator.ATTESTOR_ROTATION_DELAY()).to.equal(ROTATION_DELAY);
     });
 
     it("refuses to deploy above the tier ceiling", async function () {
@@ -646,7 +656,13 @@ describe("ZappCheckoutIntegrator", function () {
   describe("administration", function () {
     it("restricts every setter to the owner", async function () {
       await expect(
-        integrator.connect(stranger).setAttestor(stranger.address)
+        integrator.connect(stranger).setPendingAttestor(stranger.address)
+      ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
+      await expect(
+        integrator.connect(stranger).applyPendingAttestor()
+      ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
+      await expect(
+        integrator.connect(stranger).cancelPendingAttestor()
       ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
       await expect(
         integrator.connect(stranger).setLivenessTierCap(1)
@@ -771,12 +787,31 @@ describe("ZappCheckoutIntegrator", function () {
       expect(await integrator.effectiveLimit(user.address)).to.equal(TIER_CAP);
     });
 
-    it("rotates the attestor without touching existing grants", async function () {
+    it("rotates the attestor only after the delay, without touching existing grants", async function () {
       await verify(user, USDC(18));
-      await expect(integrator.connect(owner).setAttestor(stranger.address))
+
+      const proposedAt = (await latestTimestamp()) + 10n;
+      const readyAt = proposedAt + ROTATION_DELAY;
+      await setNextBlockTimestamp(proposedAt);
+      await expect(integrator.connect(owner).setPendingAttestor(stranger.address))
+        .to.emit(integrator, "AttestorProposed")
+        .withArgs(stranger.address, readyAt);
+      expect(await integrator.pendingAttestor()).to.equal(stranger.address);
+      expect(await integrator.pendingAttestorReadyAt()).to.equal(readyAt);
+      expect(await integrator.attestor()).to.equal(attestor.address);
+
+      await setNextBlockTimestamp(readyAt - 1n);
+      await expect(integrator.connect(owner).applyPendingAttestor())
+        .to.be.revertedWithCustomError(integrator, "AttestorRotationNotReady")
+        .withArgs(readyAt);
+
+      await setNextBlockTimestamp(readyAt);
+      await expect(integrator.connect(owner).applyPendingAttestor())
         .to.emit(integrator, "AttestorUpdated")
         .withArgs(stranger.address);
       expect(await integrator.attestor()).to.equal(stranger.address);
+      expect(await integrator.pendingAttestor()).to.equal(ethers.ZeroAddress);
+      expect(await integrator.pendingAttestorReadyAt()).to.equal(0);
       expect(await integrator.grantedLimit(user.address)).to.equal(USDC(18));
 
       // The old key no longer verifies anyone.
@@ -788,11 +823,85 @@ describe("ZappCheckoutIntegrator", function () {
       ).to.be.revertedWithCustomError(integrator, "InvalidSignature");
     });
 
-    it("rejects rotating the attestor to the zero address", async function () {
+    it("gives the owner no instant path to grants signed by its own key", async function () {
+      await integrator.connect(owner).setPendingAttestor(owner.address);
+
+      const nullifier = nullifierFor("owner-minted");
+      const expiry = await futureExpiry(Number(ROTATION_DELAY) + 3600);
+      const sig = await signAttestation(owner, user2.address, nullifier, TIER_CAP, expiry);
       await expect(
-        integrator.connect(owner).setAttestor(ethers.ZeroAddress)
-      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+        integrator.connect(user2).submitLivenessAttestation(nullifier, TIER_CAP, expiry, sig)
+      ).to.be.revertedWithCustomError(integrator, "InvalidSignature");
+      await expect(integrator.connect(owner).applyPendingAttestor()).to.be.revertedWithCustomError(
+        integrator,
+        "AttestorRotationNotReady"
+      );
+
+      // Once the public window has passed it can: the delay makes this visible,
+      // it does not remove it.
+      await setNextBlockTimestamp(await integrator.pendingAttestorReadyAt());
+      await integrator.connect(owner).applyPendingAttestor();
+      await expect(
+        integrator.connect(user2).submitLivenessAttestation(nullifier, TIER_CAP, expiry, sig)
+      ).to.emit(integrator, "LivenessVerified");
+    });
+
+    it("restarts the delay when a proposal is replaced", async function () {
+      await integrator.connect(owner).setPendingAttestor(stranger.address);
+      const firstReadyAt = await integrator.pendingAttestorReadyAt();
+
+      await setNextBlockTimestamp(firstReadyAt - 3600n);
+      await integrator.connect(owner).setPendingAttestor(user2.address);
+      const secondReadyAt = firstReadyAt - 3600n + ROTATION_DELAY;
+      expect(await integrator.pendingAttestorReadyAt()).to.equal(secondReadyAt);
+
+      await setNextBlockTimestamp(firstReadyAt);
+      await expect(integrator.connect(owner).applyPendingAttestor())
+        .to.be.revertedWithCustomError(integrator, "AttestorRotationNotReady")
+        .withArgs(secondReadyAt);
+      expect(await integrator.pendingAttestor()).to.equal(user2.address);
+    });
+
+    it("cancels a pending rotation", async function () {
+      await expect(integrator.connect(owner).cancelPendingAttestor()).to.be.revertedWithCustomError(
+        integrator,
+        "NoPendingAttestor"
+      );
+      await expect(integrator.connect(owner).applyPendingAttestor()).to.be.revertedWithCustomError(
+        integrator,
+        "NoPendingAttestor"
+      );
+
+      await integrator.connect(owner).setPendingAttestor(stranger.address);
+      await expect(integrator.connect(owner).cancelPendingAttestor())
+        .to.emit(integrator, "AttestorProposalCancelled")
+        .withArgs(stranger.address);
+      expect(await integrator.pendingAttestor()).to.equal(ethers.ZeroAddress);
+      expect(await integrator.pendingAttestorReadyAt()).to.equal(0);
+
+      await ethers.provider.send("evm_increaseTime", [Number(ROTATION_DELAY)]);
+      await expect(integrator.connect(owner).applyPendingAttestor()).to.be.revertedWithCustomError(
+        integrator,
+        "NoPendingAttestor"
+      );
       expect(await integrator.attestor()).to.equal(attestor.address);
+    });
+
+    it("sets a first attestor through the same delay", async function () {
+      const bare = await deployIntegrator(TIER_CAP, DAILY_COUNT, ethers.ZeroAddress);
+      await bare.connect(owner).setPendingAttestor(attestor.address);
+      expect(await bare.attestor()).to.equal(ethers.ZeroAddress);
+
+      await setNextBlockTimestamp(await bare.pendingAttestorReadyAt());
+      await bare.connect(owner).applyPendingAttestor();
+      expect(await bare.attestor()).to.equal(attestor.address);
+    });
+
+    it("rejects a zero pending attestor", async function () {
+      await expect(
+        integrator.connect(owner).setPendingAttestor(ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      expect(await integrator.pendingAttestor()).to.equal(ethers.ZeroAddress);
     });
 
     it("sweeps stray USDC — the contract holds none in normal operation", async function () {

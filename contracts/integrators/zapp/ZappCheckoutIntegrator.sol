@@ -84,6 +84,8 @@ contract ZappCheckoutIntegrator is IP2PIntegrator, Ownable2Step {
     error Reentrancy();
 
     error AttestorNotSet();
+    error NoPendingAttestor();
+    error AttestorRotationNotReady(uint256 readyAt);
     error AttestationExpired();
     error NullifierAlreadySpent();
     error InvalidSignature();
@@ -97,6 +99,8 @@ contract ZappCheckoutIntegrator is IP2PIntegrator, Ownable2Step {
 
     // ─── Events ───────────────────────────────────────────────────────
 
+    event AttestorProposed(address indexed attestor, uint256 readyAt);
+    event AttestorProposalCancelled(address indexed attestor);
     event AttestorUpdated(address indexed attestor);
     event Paused(address indexed account);
     event Unpaused(address indexed account);
@@ -174,6 +178,8 @@ contract ZappCheckoutIntegrator is IP2PIntegrator, Ownable2Step {
     uint256 public constant MAX_LIVENESS_TIER_CAP = 20e6;
     /// @notice At most 5 onramp placements per user per day.
     uint256 public constant MAX_DAILY_TX_COUNT_LIMIT = 5;
+    /// @notice How long a proposed attestor waits before it can be applied.
+    uint256 public constant ATTESTOR_ROTATION_DELAY = 48 hours;
 
     // ─── EIP-712 (simple-kyc liveness service) ────────────────────────
 
@@ -202,6 +208,10 @@ contract ZappCheckoutIntegrator is IP2PIntegrator, Ownable2Step {
     /// @notice secp256k1 signer of the liveness service's attestations
     ///         (simple-kyc liveness verifier, `GET /v1/attestor`).
     address public attestor;
+    /// @notice Attestor waiting out `ATTESTOR_ROTATION_DELAY`, or 0.
+    address public pendingAttestor;
+    /// @notice Earliest time `pendingAttestor` can be applied.
+    uint256 public pendingAttestorReadyAt;
 
     /// @notice On-chain per-tx ceiling, bounded by `MAX_LIVENESS_TIER_CAP`.
     ///         Setting it to 0 halts new orders without touching anyone's
@@ -282,7 +292,8 @@ contract ZappCheckoutIntegrator is IP2PIntegrator, Ownable2Step {
      * @param _attestor     Liveness service signer. MUST be read from the
      *                      service's own `/v1/attestor` endpoint — never a
      *                      value relayed by a partner or teammate. May be 0
-     *                      here and set once known.
+     *                      here and set once known, through the same delayed
+     *                      rotation as any other change.
      * @param _tierCap      Per-tx cap in micro-USDC (<= $20).
      * @param _dailyTxCount Placements per user per day (1..5).
      *
@@ -313,16 +324,50 @@ contract ZappCheckoutIntegrator is IP2PIntegrator, Ownable2Step {
 
     // ─── Administration (tightening + emergency only) ─────────────────
 
-    /// @notice Rotate the attestation signer. Verifies nothing retroactively:
-    ///         already-granted limits stand (use `setBlocked` to stop a
-    ///         wallet).
-    /// @dev    Zero is rejected: it would brick every submission with
-    ///         `AttestorNotSet`. `pause()` and `setLivenessTierCap(0)` are the
-    ///         kill switches for orders.
-    function setAttestor(address newAttestor) external onlyOwner {
+    /**
+     * @notice Propose a new attestation signer. It takes effect only through
+     *         `applyPendingAttestor`, `ATTESTOR_ROTATION_DELAY` later.
+     * @dev    The attestor decides who gets a grant, so an instant rotation
+     *         would let the owner key point it at a key of its own and sign
+     *         grants for fresh wallets in the same block. The delay does not
+     *         prevent that; it makes it visible (`AttestorProposed`) for 48
+     *         hours first, which is the window for P2P to
+     *         `deactivateIntegrator`. A new proposal replaces the old one and
+     *         restarts the clock.
+     *
+     *         Zero is rejected: it would brick every submission with
+     *         `AttestorNotSet`. `pause()` and `setLivenessTierCap(0)` are the
+     *         kill switches for orders.
+     */
+    function setPendingAttestor(address newAttestor) external onlyOwner {
         if (newAttestor == address(0)) revert InvalidAddress();
-        attestor = newAttestor;
-        emit AttestorUpdated(newAttestor);
+        uint256 readyAt = block.timestamp + ATTESTOR_ROTATION_DELAY;
+        pendingAttestor = newAttestor;
+        pendingAttestorReadyAt = readyAt;
+        emit AttestorProposed(newAttestor, readyAt);
+    }
+
+    /// @notice Install the pending attestor once its delay has passed.
+    ///         Verifies nothing retroactively: already-granted limits stand
+    ///         (use `setBlocked` to stop a wallet).
+    function applyPendingAttestor() external onlyOwner {
+        address next = pendingAttestor;
+        if (next == address(0)) revert NoPendingAttestor();
+        uint256 readyAt = pendingAttestorReadyAt;
+        if (block.timestamp < readyAt) revert AttestorRotationNotReady(readyAt);
+
+        attestor = next;
+        delete pendingAttestor;
+        delete pendingAttestorReadyAt;
+        emit AttestorUpdated(next);
+    }
+
+    function cancelPendingAttestor() external onlyOwner {
+        address next = pendingAttestor;
+        if (next == address(0)) revert NoPendingAttestor();
+        delete pendingAttestor;
+        delete pendingAttestorReadyAt;
+        emit AttestorProposalCancelled(next);
     }
 
     /**
