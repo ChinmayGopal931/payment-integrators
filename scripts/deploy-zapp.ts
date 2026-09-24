@@ -1,4 +1,5 @@
 import { ethers } from "hardhat";
+import { getIntegratorConfig } from "./lib/diamond";
 
 /**
  * Deploy + whitelist ZappCheckoutIntegrator — the fiat -> Base USDC onramp
@@ -64,11 +65,12 @@ const DRY_RUN = process.env.DRY_RUN === "1" || process.env.DRY_RUN === "true";
 
 const REGISTER_ABI = [
   "function registerIntegrator(address integrator, bool usdcThroughIntegrator, address proxyImpl)",
-  // NOTE the tuple wrapper and `activeOrderCount` — decoding this as a flat
-  // 3-field return silently reads activeOrderCount as `proxyImpl` (i.e. 0) and
-  // makes a perfectly good registration look failed.
-  "function getIntegratorConfig(address) view returns (tuple(bool isActive, bool usdcThroughIntegrator, uint256 activeOrderCount, address proxyImpl))",
 ];
+
+// Reading the registration back goes through scripts/lib/diamond.ts (#60),
+// which decodes the 5-field `IntegratorConfig` by shape. A 4-field literal
+// reads `proxyImpl` off the `activeOrderCount` slot as address(0), which blinds
+// the "already locked" pre-check and fails a good registration afterwards.
 
 const ERC20_ABI = [
   "function symbol() view returns (string)",
@@ -183,7 +185,7 @@ async function main() {
   if (!SKIP_REGISTER) {
     console.log("\nRegistering on the Diamond (usdcThroughIntegrator=false)…");
     const b2b = new ethers.Contract(DIAMOND_ADDRESS, REGISTER_ABI, deployer);
-    const before = await b2b.getIntegratorConfig(integratorAddr);
+    const before = await getIntegratorConfig(ethers.provider, DIAMOND_ADDRESS, integratorAddr);
     if (
       before.proxyImpl !== ethers.ZeroAddress &&
       before.proxyImpl.toLowerCase() !== proxyImpl.toLowerCase()
@@ -194,7 +196,7 @@ async function main() {
     await tx.wait(1);
     console.log("  registerIntegrator tx:", tx.hash);
 
-    const cfg = await b2b.getIntegratorConfig(integratorAddr);
+    const cfg = await getIntegratorConfig(ethers.provider, DIAMOND_ADDRESS, integratorAddr);
     console.log(
       `  config: isActive=${cfg.isActive} usdcThroughIntegrator=${cfg.usdcThroughIntegrator} proxyImpl=${cfg.proxyImpl}`
     );
