@@ -38,6 +38,10 @@ import { getIntegratorConfig } from "./lib/diamond";
  * can mint test attestations locally. That is a testnet-only placeholder —
  * rotate with `setAttestor` before anything real.
  *
+ * ── The owner ─────────────────────────────────────────────────────────────
+ * `DEPLOY_OWNER` defaults to the deployer on testnet. On mainnet it is required
+ * and must be a contract (the Zapp multisig): the script refuses a plain EOA.
+ *
  * Usage:
  *   [DIAMOND_ADDRESS=0x...] [USDC_ADDRESS=0x...] [ATTESTOR=0x...] \
  *   [TIER_CAP=20000000] [DAILY_TX_COUNT_LIMIT=5] \
@@ -105,6 +109,27 @@ async function main() {
     throw new Error("DIAMOND_ADDRESS and USDC_ADDRESS are required (no preset on this network)");
   }
 
+  // ── Owner ───────────────────────────────────────────────────────────────
+  // `owner` is OZ `Ownable2Step`, so it can be handed over later, but the owner
+  // can rotate the attestor to a key it holds and sign grants for fresh wallets.
+  // On mainnet that key must be a multisig from the first block, never a hot EOA
+  // waiting for a handover. An EIP-7702 delegation (code 0xef0100…) is still an
+  // EOA: its private key keeps full control.
+  if (isMainnet && !process.env.DEPLOY_OWNER) {
+    throw new Error("DEPLOY_OWNER is required on mainnet — pass the Zapp multisig.");
+  }
+  if (!ethers.isAddress(DEPLOY_OWNER)) {
+    throw new Error(`DEPLOY_OWNER is not an address: ${DEPLOY_OWNER}`);
+  }
+  const ownerCode = await ethers.provider.getCode(DEPLOY_OWNER);
+  const ownerIsEoa = ownerCode === "0x" || ownerCode.toLowerCase().startsWith("0xef0100");
+  if (isMainnet && ownerIsEoa) {
+    throw new Error(
+      `DEPLOY_OWNER ${DEPLOY_OWNER} is an EOA on mainnet ` +
+        `(${ownerCode === "0x" ? "no code" : "EIP-7702 delegation only"}). Pass the Zapp multisig.`
+    );
+  }
+
   // ── Attestor ────────────────────────────────────────────────────────────
   if (!ATTESTOR) {
     if (isMainnet) {
@@ -147,7 +172,9 @@ async function main() {
   }
 
   console.log("\nConfig:");
-  console.log(`  owner:            ${DEPLOY_OWNER}`);
+  console.log(
+    `  owner:            ${DEPLOY_OWNER}${ownerIsEoa ? "  (⚠️ EOA — testnet only, mainnet needs a multisig)" : ""}`
+  );
   console.log(
     `  attestor:         ${ATTESTOR}${ATTESTOR === deployer.address ? "  (⚠️ deployer placeholder)" : ""}`
   );

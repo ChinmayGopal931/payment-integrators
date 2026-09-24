@@ -7,6 +7,8 @@ import { UserProxy } from "../../base/UserProxy.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
+import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
+import { Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
 /**
  * @title ZappCheckoutIntegrator
@@ -66,18 +68,18 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
  *         nullifier is single-use, which is the on-chain half of the Sybil
  *         defence (face dedup is the off-chain half).
  */
-contract ZappCheckoutIntegrator is IP2PIntegrator {
+contract ZappCheckoutIntegrator is IP2PIntegrator, Ownable2Step {
     using SafeERC20 for IERC20;
 
     // ─── Errors ───────────────────────────────────────────────────────
 
     error OnlyDiamond();
-    error OnlyOwner();
     error InvalidAddress();
     error InvalidAmount();
     error InvalidLimit();
     /// @notice A limit was set above its immutable `MAX_*` policy ceiling.
     error CapExceedsCeiling();
+    error RenounceDisabled();
     error ContractPaused();
     error Reentrancy();
 
@@ -191,7 +193,6 @@ contract ZappCheckoutIntegrator is IP2PIntegrator {
 
     address public immutable diamond;
     IERC20 public immutable usdc;
-    address public immutable owner;
     /// @notice Canonical `UserProxy` master this integrator clones from.
     ///         Pinned on the Diamond at registration and set-once there.
     address public immutable proxyImpl;
@@ -263,11 +264,6 @@ contract ZappCheckoutIntegrator is IP2PIntegrator {
         _;
     }
 
-    modifier onlyOwner() {
-        if (msg.sender != owner) revert OnlyOwner();
-        _;
-    }
-
     modifier nonReentrant() {
         if (_reentrancyLock != 1) revert Reentrancy();
         _reentrancyLock = 2;
@@ -279,6 +275,10 @@ contract ZappCheckoutIntegrator is IP2PIntegrator {
      * @param _diamond      P2P Diamond proxy for the target network.
      * @param _usdc         USDC the Diamond settles in on that network.
      * @param _owner        Operator key: pause, denylist, tighten limits.
+     *                      Transferable later, two-step: `transferOwnership`
+     *                      names a pending owner, who must `acceptOwnership`
+     *                      from their own key. `renounceOwnership` is
+     *                      disabled.
      * @param _attestor     Liveness service signer. MUST be read from the
      *                      service's own `/v1/attestor` endpoint — never a
      *                      value relayed by a partner or teammate. May be 0
@@ -296,14 +296,13 @@ contract ZappCheckoutIntegrator is IP2PIntegrator {
         address _attestor,
         uint256 _tierCap,
         uint256 _dailyTxCount
-    ) {
-        if (_diamond == address(0) || _usdc == address(0) || _owner == address(0)) {
+    ) Ownable(_owner) {
+        if (_diamond == address(0) || _usdc == address(0)) {
             revert InvalidAddress();
         }
 
         diamond = _diamond;
         usdc = IERC20(_usdc);
-        owner = _owner;
         attestor = _attestor;
 
         _setLivenessTierCap(_tierCap);
@@ -349,6 +348,13 @@ contract ZappCheckoutIntegrator is IP2PIntegrator {
     function setBlocked(address user, bool isBlocked) external onlyOwner {
         blocked[user] = isBlocked;
         emit UserBlocked(user, isBlocked);
+    }
+
+    /// @notice Disabled. Burning ownership would permanently disable pause,
+    ///         `setBlocked`, the cap setters, attestor rotation and
+    ///         `sweepUsdc`. Hand over control with `transferOwnership`.
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
     }
 
     function pause() external onlyOwner {

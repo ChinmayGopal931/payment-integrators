@@ -647,27 +647,88 @@ describe("ZappCheckoutIntegrator", function () {
     it("restricts every setter to the owner", async function () {
       await expect(
         integrator.connect(stranger).setAttestor(stranger.address)
-      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
       await expect(
         integrator.connect(stranger).setLivenessTierCap(1)
-      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
       await expect(
         integrator.connect(stranger).setDailyTxCountLimit(1)
-      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
       await expect(
         integrator.connect(stranger).setBlocked(user.address, true)
-      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
       await expect(integrator.connect(stranger).pause()).to.be.revertedWithCustomError(
         integrator,
-        "OnlyOwner"
-      );
-      await expect(integrator.connect(stranger).unpause()).to.be.revertedWithCustomError(
-        integrator,
-        "OnlyOwner"
+        "OwnableUnauthorizedAccount"
       );
       await expect(
         integrator.connect(stranger).sweepUsdc(stranger.address, 1)
-      ).to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
+      // unpause too: stripped of onlyOwner, anyone could lift an incident pause.
+      await integrator.connect(owner).pause();
+      await expect(integrator.connect(stranger).unpause()).to.be.revertedWithCustomError(
+        integrator,
+        "OwnableUnauthorizedAccount"
+      );
+    });
+
+    it("transfers ownership in two steps — the new owner must accept", async function () {
+      await expect(integrator.connect(owner).transferOwnership(stranger.address))
+        .to.emit(integrator, "OwnershipTransferStarted")
+        .withArgs(owner.address, stranger.address);
+
+      // Nothing has moved yet: the current owner still holds every lever.
+      expect(await integrator.owner()).to.equal(owner.address);
+      expect(await integrator.pendingOwner()).to.equal(stranger.address);
+      await expect(integrator.connect(stranger).pause()).to.be.revertedWithCustomError(
+        integrator,
+        "OwnableUnauthorizedAccount"
+      );
+
+      await expect(integrator.connect(stranger).acceptOwnership())
+        .to.emit(integrator, "OwnershipTransferred")
+        .withArgs(owner.address, stranger.address);
+      expect(await integrator.owner()).to.equal(stranger.address);
+      expect(await integrator.pendingOwner()).to.equal(ethers.ZeroAddress);
+
+      await expect(integrator.connect(owner).pause()).to.be.revertedWithCustomError(
+        integrator,
+        "OwnableUnauthorizedAccount"
+      );
+      await expect(integrator.connect(stranger).pause()).to.not.be.reverted;
+    });
+
+    it("restricts ownership transfer to the owner, and acceptance to the pending owner", async function () {
+      await expect(
+        integrator.connect(stranger).transferOwnership(stranger.address)
+      ).to.be.revertedWithCustomError(integrator, "OwnableUnauthorizedAccount");
+
+      await integrator.connect(owner).transferOwnership(stranger.address);
+      await expect(integrator.connect(user).acceptOwnership()).to.be.revertedWithCustomError(
+        integrator,
+        "OwnableUnauthorizedAccount"
+      );
+      expect(await integrator.owner()).to.equal(owner.address);
+    });
+
+    it("cancels a pending transfer via the zero address", async function () {
+      await integrator.connect(owner).transferOwnership(stranger.address);
+      await integrator.connect(owner).transferOwnership(ethers.ZeroAddress);
+      expect(await integrator.pendingOwner()).to.equal(ethers.ZeroAddress);
+
+      await expect(integrator.connect(stranger).acceptOwnership()).to.be.revertedWithCustomError(
+        integrator,
+        "OwnableUnauthorizedAccount"
+      );
+      expect(await integrator.owner()).to.equal(owner.address);
+    });
+
+    it("cannot renounce ownership — even the owner", async function () {
+      await expect(integrator.connect(owner).renounceOwnership()).to.be.revertedWithCustomError(
+        integrator,
+        "RenounceDisabled"
+      );
+      expect(await integrator.owner()).to.equal(owner.address);
     });
 
     it("pauses and resumes the onramp", async function () {
@@ -791,7 +852,24 @@ describe("ZappCheckoutIntegrator", function () {
       ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
       await expect(
         F.deploy(diamondAddr, usdcAddr, ethers.ZeroAddress, attestor.address, TIER_CAP, DAILY_COUNT)
-      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      )
+        .to.be.revertedWithCustomError(integrator, "OwnableInvalidOwner")
+        .withArgs(ethers.ZeroAddress);
+    });
+
+    it("sets owner from the constructor argument, not the deployer", async function () {
+      // Every other deploy here passes the deployer as `_owner`, which would hide
+      // an `Ownable(msg.sender)` regression.
+      const F = await ethers.getContractFactory("ZappCheckoutIntegrator", stranger);
+      const integ = await F.deploy(
+        diamondAddr,
+        usdcAddr,
+        owner.address,
+        attestor.address,
+        TIER_CAP,
+        DAILY_COUNT
+      );
+      expect(await integ.owner()).to.equal(owner.address);
     });
 
     it("deploys its own canonical UserProxy master", async function () {
