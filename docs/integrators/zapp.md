@@ -1,7 +1,7 @@
 # Zapp — fiat → USDC onramp (liveness)
 
-Fiat on-ramp for [Zapp](https://zapp.app), a prediction-market betting
-app. Buyers pay local fiat (INR via UPI) and receive Base USDC **directly in
+Fiat on-ramp for [Zapp](https://justzappit.xyz), a privacy-first Zcash
+wallet. Buyers pay local fiat (INR via UPI) and receive Base USDC **directly in
 their own wallet**, gated on a single liveness attestation from the simple-kyc
 service.
 
@@ -66,13 +66,14 @@ view is unreadable. The integrator's balance is emitted for diagnosis but is not
 the signal: nothing here consumes the balance, so a stranger could donate one
 order's worth and hold the alarm on until an owner swept.
 
-### Bridging is not on-chain here
+### The swap to ZEC is not on-chain here
 
-Zapp's betting balance lives on Polygon; this integrator delivers USDC on
-Base. That second leg deliberately runs from the user's own wallet in the app,
-not from inside the contract. Bridging here would mean taking custody of every
-buyer's proceeds and re-deriving each user's share — reintroducing exactly the
-stranded-funds surface that direct settlement avoids.
+Zapp's Buy ZEC delivers shielded ZEC; this integrator delivers USDC on Base.
+The swap from one to the other deliberately runs from the user's own Base
+account in the app, after settlement, not from inside the contract. Swapping
+here would mean taking custody of every buyer's proceeds and re-deriving each
+user's share — reintroducing exactly the stranded-funds surface that direct
+settlement avoids.
 
 ## 3. The gate: liveness, one tier
 
