@@ -727,6 +727,13 @@ describe("ZappCheckoutIntegrator", function () {
       ).to.be.revertedWithCustomError(integrator, "InvalidSignature");
     });
 
+    it("rejects rotating the attestor to the zero address", async function () {
+      await expect(
+        integrator.connect(owner).setAttestor(ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      expect(await integrator.attestor()).to.equal(attestor.address);
+    });
+
     it("sweeps stray USDC — the contract holds none in normal operation", async function () {
       await verify(user, TIER_CAP);
       await buyAndComplete(user, USDC(20));

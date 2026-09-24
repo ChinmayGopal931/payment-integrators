@@ -317,7 +317,11 @@ contract ZappCheckoutIntegrator is IP2PIntegrator {
     /// @notice Rotate the attestation signer. Verifies nothing retroactively:
     ///         already-granted limits stand (use `setBlocked` to stop a
     ///         wallet).
+    /// @dev    Zero is rejected: it would brick every submission with
+    ///         `AttestorNotSet`. `pause()` and `setLivenessTierCap(0)` are the
+    ///         kill switches for orders.
     function setAttestor(address newAttestor) external onlyOwner {
+        if (newAttestor == address(0)) revert InvalidAddress();
         attestor = newAttestor;
         emit AttestorUpdated(newAttestor);
     }
